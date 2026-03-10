@@ -142,7 +142,7 @@ const startListening = () => {
           <div className="flex items-center gap-4">
             <button onClick={() => setIsSidebarOpen(true)} className="lg:hidden p-2 text-slate-600 hover:bg-slate-100 rounded-xl"><Menu size={24} /></button>
             <div>
-              <h1 className="font-extrabold text-slate-900 text-lg lg:text-xl">The Inclusive Citizen</h1>
+              <h1 className="font-extrabold text-slate-900 text-lg lg:text-xl">SuaraGov</h1>
               <p className="text-[10px] text-emerald-600 font-bold uppercase tracking-wider flex items-center gap-1">
                 <span className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></span> Official Government AI
               </p>
