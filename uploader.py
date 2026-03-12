@@ -1,28 +1,34 @@
 import os
 import glob
-from dotenv import load_dotenv  # <-- ADD THIS
+from dotenv import load_dotenv 
 from supabase import create_client
 from sentence_transformers import SentenceTransformer
 
-# 1. Load the variables from your .env file
 load_dotenv() 
 
-# 2. Configuration
+# --- CONFIGURATION ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+CHUNK_SIZE = 1000  # Number of characters per chunk
+CHUNK_OVERLAP = 200 # Overlap to keep context between chunks
 
-# 3. Initialize Clients carefully
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("❌ Error: Could not find Supabase credentials in .env file!")
-    exit() # Stop the script if keys are missing
+    exit()
 else:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Using DistilUSE for 512-dimension vectors
 model = SentenceTransformer('distiluse-base-multilingual-cased-v2')
 
 def get_embedding(text):
     return model.encode(text).tolist()
+
+# NEW: Helper function to slice the text
+def create_chunks(text, size, overlap):
+    chunks = []
+    for i in range(0, len(text), size - overlap):
+        chunks.append(text[i : i + size])
+    return chunks
 
 def upload_all_markdown_files():
     files = glob.glob("*.md")
@@ -31,7 +37,7 @@ def upload_all_markdown_files():
         print("Empty pantry! No .md files found to upload.")
         return
 
-    print(f"📚 Found {len(files)} files. Starting sync to Supabase...")
+    print(f"📚 Found {len(files)} files. Starting chunked sync...")
 
     for file_path in files:
         file_name = os.path.basename(file_path)
@@ -46,21 +52,31 @@ def upload_all_markdown_files():
         else:
             content = "".join(lines)
 
-        data = {
-            "content": content,
-            "embedding": get_embedding(content),
-            "title": file_name,
-            "source_url": source_url,
-            "language": "ms",
-            "document_type": "government_doc", 
-            "region": "Malaysia"
-        }
+        # NEW: Split content into chunks
+        chunks = create_chunks(content, CHUNK_SIZE, CHUNK_OVERLAP)
+        print(f"✂️ Slicing {file_name} into {len(chunks)} chunks...")
 
-        try:
-            supabase.table("embeddings").upsert(data, on_conflict="title").execute()
-            print(f"✅ Successfully synced {file_name} to the team table!")
-        except Exception as e:
-            print(f"❌ Error uploading {file_name}: {e}")
+        for index, chunk_text in enumerate(chunks):
+            # Create a unique title for each chunk to avoid 'upsert' overwriting
+            unique_title = f"{file_name}_chunk_{index}"
+            
+            data = {
+                "content": chunk_text,
+                "embedding": get_embedding(chunk_text),
+                "title": unique_title,
+                "source_url": source_url,
+                "language": "ms",
+                "document_type": "government_doc", 
+                "region": "Malaysia"
+            }
+
+            try:
+                # Use unique_title for the on_conflict check
+                supabase.table("embeddings").upsert(data, on_conflict="title").execute()
+            except Exception as e:
+                print(f"❌ Error uploading {unique_title}: {e}")
+        
+        print(f"✅ Finished {file_name}")
 
 if __name__ == "__main__":
     upload_all_markdown_files()
