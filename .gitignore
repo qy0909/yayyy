@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.md
+.next/
+node_modules/
