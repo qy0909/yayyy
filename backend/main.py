@@ -6,19 +6,21 @@ Exposes RAG pipeline as REST API for Next.js frontend
 
 import sys
 import io
+import os
+import shutil
 
 # Fix Unicode encoding for Windows console
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 from typing import Optional, List, Dict, Any
 import uvicorn
-import os
 from dotenv import load_dotenv
+import whisper #voice processing
 
 # Load environment variables
 load_dotenv()
@@ -30,17 +32,15 @@ app = FastAPI(
     version="1.0.0"
 )
 
+stt_model = whisper.load_model("base", device="cpu")
+
 # Lazy import RAG Pipeline (loaded on first use to avoid startup issues)
 RAGPipeline = None
 
 # Configure CORS for Next.js frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",  # Next.js dev server
-        "http://localhost:3001",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -158,6 +158,27 @@ async def health_check():
         "message": "RAG pipeline will load on first query" if rag_pipeline is None else "RAG pipeline ready"
     }
 
+@app.post("/transcribe")
+async def transcribe_voice(file: UploadFile = File(...)):
+    try:
+        # Save the incoming audio blob to a temporary file
+        temp_path = "temp_voice_input.wav"
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Run Whisper transcription
+        result = stt_model.transcribe(temp_path, fp16=False)
+        
+        print(f"Transcribed: {result['text']}")
+        
+        return {
+            "success": True, 
+            "text": result["text"].strip(),
+            "detected_lang": result.get("language")
+        }
+    except Exception as e:
+        print(f"❌ STT Error: {e}")
+        return {"success": False, "error": str(e)}
 
 @app.post("/api/chat", response_model=QueryResponse)
 async def chat(request: QueryRequest):

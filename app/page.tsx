@@ -31,6 +31,8 @@ export default function InclusiveApp() {
   const [currentDebugLogs, setCurrentDebugLogs] = useState<string[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [previewSourceUrl, setPreviewSourceUrl] = useState<string | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const [isTranscribing, setIsTranscribing] = useState(false);
 
   // Auto-scroll to bottom on new message
   useEffect(() => {
@@ -51,42 +53,51 @@ export default function InclusiveApp() {
       }]);
     }
   }, []);
-const startListening = () => {
-    // Check for browser support (Chrome, Edge, Safari support webkitSpeechRecognition)
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    
-    if (!SpeechRecognition) {
-      alert("Your browser does not support voice input. Please try Chrome or Edge.");
+
+  const toggleListening = async () => {
+    // If already listening, stop it manually
+    if (isListening && mediaRecorderRef.current) {
+      mediaRecorderRef.current.stop();
+      setIsListening(false);
       return;
     }
 
-    const recognition = new SpeechRecognition();
-    recognition.lang = language; // Uses the state variable ms-MY or en-US
-    recognition.continuous = false;
-    recognition.interimResults = false;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+      const audioChunks: Blob[] = [];
 
-    recognition.onstart = () => {
+      mediaRecorder.ondataavailable = (event) => audioChunks.push(event.data);
+
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+        setIsTyping(false);
+        setIsTranscribing(true); // Start transcription loading
+
+        const formData = new FormData();
+        formData.append('file', audioBlob, 'input_audio.wav');
+
+        try {
+          const response = await fetch('http://localhost:8000/transcribe', {
+            method: 'POST',
+            body: formData,
+          });
+          const data = await response.json();
+          if (data.success) setInput(data.text);
+        } catch (err) {
+          console.error("Transcription failed:", err);
+        } finally {
+          setIsTranscribing(false);
+          stream.getTracks().forEach(track => track.stop());
+        }
+      };
+
+      mediaRecorder.start();
       setIsListening(true);
-    };
-
-    recognition.onresult = (event: any) => {
-      const transcript = event.results[0][0].transcript;
-      setInput(transcript);
-      setIsListening(false);
-      // Optional: Automatically send the message after speaking
-      // handleSend(transcript); 
-    };
-
-    recognition.onerror = (event: any) => {
-      console.error("Speech recognition error:", event.error);
-      setIsListening(false);
-    };
-
-    recognition.onend = () => {
-      setIsListening(false);
-    };
-
-    recognition.start();
+    } catch (err) {
+      alert("Please allow microphone access.");
+    }
   };
 
   const handleSimplify = async (messageIndex: number, text: string) => {
@@ -548,27 +559,67 @@ const startListening = () => {
               <button onClick={() => handleSend("How to get legal help?")} className="shrink-0 flex items-center gap-2 bg-slate-50 border border-slate-200 px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 hover:bg-amber-50 hover:border-amber-200 transition-colors"><Scale size={16}/> Legal Help</button>
             </div>
 
-            <div className="relative flex items-end gap-3 bg-slate-50 border-2 border-slate-200 rounded-[2rem] p-2 focus-within:border-emerald-500 transition-all shadow-inner">
+            <div className="relative flex items-end gap-3 bg-slate-50 border-2 border-slate-200 rounded-[2rem] p-2 focus-within:border-emerald-500 transition-all shadow-inner overflow-hidden min-h-[72px]">
+              
+              {/* LISTENING OVERLAY */}
+              {isListening && (
+                <div className="absolute inset-0 bg-rose-50/95 backdrop-blur-sm z-30 flex items-center px-6 animate-in fade-in zoom-in-95 duration-200">
+                  <div className="flex gap-1.5 items-center mr-4">
+                    <span className="w-1.5 h-4 bg-rose-500 rounded-full animate-bounce [animation-delay:-0.3s]"></span>
+                    <span className="w-1.5 h-6 bg-rose-500 rounded-full animate-bounce [animation-delay:-0.15s]"></span>
+                    <span className="w-1.5 h-4 bg-rose-500 rounded-full animate-bounce"></span>
+                  </div>
+                  <span className="text-sm font-bold text-rose-600 animate-pulse uppercase tracking-wider">
+                    Listening... Tap mic to finish
+                  </span>
+                </div>
+              )}
+
+              {/* TRANSCRIBING OVERLAY */}
+              {isTranscribing && (
+                <div className="absolute inset-0 bg-white/90 backdrop-blur-md z-30 flex items-center justify-between px-6 animate-in slide-in-from-bottom-2 duration-300">
+                  <div className="flex items-center">
+                    <Loader2 size={18} className="animate-spin text-emerald-600 mr-3" />
+                    <span className="text-sm font-bold text-slate-700 italic">Processing your voice...</span>
+                  </div>
+                  {/* Optional: Add a subtle 'Cancel' text if they want to stop processing */}
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter">Please wait</span>
+                </div>
+              )}
+
+              {/* MIC BUTTON */}
               <button 
-                onClick={startListening}
-                className={`p-4 rounded-full transition-all ${isListening ? 'bg-rose-500 text-white animate-pulse' : 'bg-white text-emerald-600 shadow-sm hover:bg-emerald-50'}`}
+                onClick={toggleListening}
+                className={`p-4 rounded-full transition-all z-40 ${
+                  isListening 
+                    ? 'bg-rose-500 text-white shadow-lg ring-4 ring-rose-100 scale-105' 
+                    : isTranscribing 
+                      ? 'opacity-0 scale-50 pointer-events-none' // Smoothly hide it
+                      : 'bg-white text-emerald-600 shadow-sm hover:bg-emerald-50'
+                }`}
               >
-                <Mic size={24} />
+                {isListening ? <X size={24} /> : <Mic size={24} />}
               </button>
               
               <textarea 
                 rows={1}
                 value={input} 
+                disabled={isListening || isTranscribing}
                 onChange={(e) => setInput(e.target.value)} 
                 onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSend())}
-                placeholder="Ask me anything..." 
-                className="flex-1 bg-transparent border-none focus:ring-0 text-slate-800 py-4 text-lg resize-none max-h-32"
+                placeholder={isListening ? "" : "Ask me anything..."} 
+                className={`flex-1 bg-transparent border-none focus:ring-0 text-slate-800 py-4 text-lg resize-none max-h-32 transition-opacity ${isTranscribing ? 'opacity-0' : 'opacity-100'}`}
               />
 
+              {/* SEND BUTTON */}
               <button 
                 onClick={() => handleSend()}
-                disabled={!input}
-                className={`p-4 rounded-full transition-all ${!input ? 'text-slate-300' : 'bg-emerald-600 text-white shadow-lg shadow-emerald-200 active:scale-90'}`}
+                disabled={!input || isListening || isTranscribing}
+                className={`p-4 rounded-full transition-all z-20 ${
+                  !input || isListening || isTranscribing 
+                    ? 'opacity-0 scale-50 pointer-events-none' 
+                    : 'bg-emerald-600 text-white shadow-lg shadow-emerald-200 active:scale-90'
+                }`}
               >
                 <Send size={24} />
               </button>
