@@ -1,6 +1,7 @@
-import requests
+import pip
 from bs4 import BeautifulSoup
 import os
+import requests
 import re
 
 def clean_filename(url):

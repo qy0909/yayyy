@@ -1,0 +1,39 @@
+# FastAPI Server
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.10.0
+python-multipart==0.0.20
+
+# Environment
+python-dotenv==1.0.1
+
+# RAG Pipeline Core
+sentence-transformers==3.3.1
+langdetect==1.0.9
+supabase==2.10.0
+
+# NLP
+spacy==3.8.3
+
+# OpenAI (Default LLM)
+openai==1.59.5
+
+# Cloud LLM Providers (Optional)
+google-generativeai==0.8.3
+groq==0.13.0
+huggingface-hub==0.27.0
+
+# Local SEA LLMs (Optional - for offline support)
+transformers==4.47.1
+torch==2.5.1
+accelerate==1.2.1
+bitsandbytes==0.45.0
+sentencepiece==0.2.0  # Required for NLLB-200 translation model
+protobuf==4.25.3  # Required for sentencepiece
+
+# Web Scraping (for data collection)
+requests==2.32.3
+beautifulsoup4==4.12.3
+
+# Utilities
+numpy==2.0.2

@@ -5,16 +5,32 @@ import {
   ShieldCheck, History, Menu, X, PlusCircle, 
   ExternalLink, FileText, Search, Loader2, Info
 } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 export default function InclusiveApp() {
   const [input, setInput] = useState("");
   const [language, setLanguage] = useState("ms-MY");
-  const [messages, setMessages] = useState<{ role: string; text: string; source?: string; dialect?: string; status?: string }[]>([]);
+  const [messages, setMessages] = useState<{ 
+    role: string; 
+    text: string; 
+    source?: string;
+    sources?: any[];
+    dialect?: string; 
+    status?: string;
+    detectedLanguage?: string;
+    debugLogs?: string[];
+    originalText?: string;
+    isSimplifying?: boolean;
+  }[]>([]);
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
+  const [showDebugPanel, setShowDebugPanel] = useState(false);
+  const [currentDebugLogs, setCurrentDebugLogs] = useState<string[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [previewSourceUrl, setPreviewSourceUrl] = useState<string | null>(null);
 
   // Auto-scroll to bottom on new message
   useEffect(() => {
@@ -72,25 +88,159 @@ const startListening = () => {
 
     recognition.start();
   };
-  const handleSend = (overrideInput?: string) => {
+
+  const handleSimplify = async (messageIndex: number, text: string) => {
+    // Set loading state for this message
+    const newMessages = messages.map((m, i) => {
+        if (i === messageIndex) {
+            return { ...m, isSimplifying: true };
+        }
+        return m;
+    });
+    setMessages(newMessages);
+
+    try {
+        const response = await fetch('/api/simplify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text }),
+        });
+        const result = await response.json();
+
+        if (result.success) {
+            const updatedMessages = messages.map((m, i) => {
+                if (i === messageIndex) {
+                    return {
+                        ...m,
+                        text: result.simplified_text,
+                        originalText: m.text, // Store original text
+                        isSimplifying: false,
+                    };
+                }
+                return m;
+            });
+            setMessages(updatedMessages);
+        } else {
+            // Handle error - maybe show a toast notification
+            console.error("Simplification failed:", result.error);
+            // Revert loading state
+            const revertedMessages = messages.map((m, i) => {
+                if (i === messageIndex) {
+                    return { ...m, isSimplifying: false };
+                }
+                return m;
+            });
+            setMessages(revertedMessages);
+        }
+    } catch (error) {
+        console.error("Simplification failed:", error);
+        // Revert loading state
+        const revertedMessages = messages.map((m, i) => {
+            if (i === messageIndex) {
+                return { ...m, isSimplifying: false };
+            }
+            return m;
+        });
+        setMessages(revertedMessages);
+    }
+  };
+
+  const handleSend = async (overrideInput?: string) => {
     const textToSend = overrideInput || input;
     if (!textToSend) return;
 
+    // Add user message to chat
     const newMessages = [...messages, { role: 'user', text: textToSend }];
     setMessages(newMessages);
     setInput("");
     setIsTyping(true);
     
-    // Simulate RAG + Processing
-    setTimeout(() => {
+    try {
+      // Call Python RAG backend via Next.js API route
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          query: textToSend,
+          top_k: 5,
+        }),
+      });
+
+      const result = await response.json();
+
       setIsTyping(false);
+
+      if (result.answer) {
+        // Success or no results (both have answer text)
+        // Format sources from the RAG response
+        const sourceUrl = result.sources && result.sources.length > 0 
+          ? result.sources[0].metadata?.url || result.sources[0].metadata?.source
+          : undefined;
+
+        if (sourceUrl) {
+          setPreviewSourceUrl(sourceUrl);
+        }
+
+        // Detect language name from code
+        const languageMap: Record<string, string> = {
+          'en': 'English',
+          'ms': 'Malay (Bahasa Malaysia)',
+          'zh': 'Chinese',
+          'ta': 'Tamil',
+          'th': 'Thai',
+          'vi': 'Vietnamese',
+          'tl': 'Tagalog',
+          'id': 'Indonesian',
+        };
+
+        const detectedLanguage = languageMap[result.detected_language] || result.detected_language;
+
+        const assistantMessage = { 
+          role: 'assistant', 
+          text: result.answer,
+          source: sourceUrl,
+          sources: result.sources, // Store all sources
+          dialect: detectedLanguage,
+          detectedLanguage: result.detected_language,
+          status: result.success ? 'verified' : 'no_results',
+          debugLogs: result.debug_logs || []
+        };
+
+        setMessages(prev => [...prev, assistantMessage]);
+        
+        // Update debug logs display
+        if (result.debug_logs && result.debug_logs.length > 0) {
+          setCurrentDebugLogs(result.debug_logs);
+        }
+
+        // Update localStorage
+        const updatedMessages = [...newMessages, assistantMessage];
+        localStorage.setItem('chat_history', JSON.stringify(updatedMessages));
+      } else if (result.error) {
+        // Actual error with error message
+        setMessages(prev => [...prev, { 
+          role: 'assistant', 
+          text: result.error,
+          dialect: "Error"
+        }]);
+      } else {
+        // Unknown error
+        setMessages(prev => [...prev, { 
+          role: 'assistant', 
+          text: "Sorry, I couldn't process your request. Please try again.",
+          dialect: "Error"
+        }]);
+      }
+    } catch (error) {
+      setIsTyping(false);
+      console.error('Chat error:', error);
+      
       setMessages(prev => [...prev, { 
         role: 'assistant', 
-        text: "Summary: You can get financial assistance for medical expenses. Please visit your nearest Social Welfare Department (JKM). Bring your MyKad and latest payslip.",
-        source: "https://www.moh.gov.my/policy_health_subsidy_2024.pdf",
-        dialect: "Simplified Malay (Basahan)"
+        text: "I'm having trouble connecting to the backend. Please ensure both servers are running:\n\n• Python backend: http://localhost:8000\n• Next.js frontend: http://localhost:3001",
+        dialect: "Connection Error"
       }]);
-    }, 1500);
+    }
   };
 
   return (
@@ -149,16 +299,19 @@ const startListening = () => {
             </div>
           </div>
           
-          <div className="flex items-center gap-2 bg-slate-100 p-1 rounded-2xl border border-slate-200">
-            {['ms-MY', 'en-US'].map((lang) => (
-              <button 
-                key={lang}
-                onClick={() => setLanguage(lang)} 
-                className={`px-4 py-1.5 rounded-xl text-xs font-bold transition-all ${language === lang ? 'bg-white text-emerald-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
-              >
-                {lang === 'ms-MY' ? 'Bahasa' : 'English'}
-              </button>
-            ))}
+          <div className="flex items-center gap-3">
+            {/* Debug Panel Toggle */}
+            <button 
+              onClick={() => setShowDebugPanel(!showDebugPanel)}
+              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all border ${
+                showDebugPanel 
+                  ? 'bg-purple-100 text-purple-700 border-purple-300' 
+                  : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-purple-50'
+              }`}
+              title="Toggle debug panel"
+            >
+              <Info size={16} />
+            </button>
           </div>
         </header>
 
@@ -178,13 +331,113 @@ const startListening = () => {
                   </div>
                 )}
 
-                <p className="text-base lg:text-lg leading-relaxed font-medium">
-                  {m.text}
-                </p>
+                <div className="prose prose-lg max-w-none text-base lg:text-lg leading-relaxed font-medium">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {m.text}
+                  </ReactMarkdown>
+                </div>
 
                 {m.role === 'assistant' && (
                   <div className="mt-6 space-y-4">
-                    {m.source && (
+                    {/* Display all sources from RAG */}
+                    {m.sources && m.sources.length > 0 && (
+                      <div className="space-y-2">
+                        <p className="text-xs font-bold text-slate-500 uppercase tracking-wide mb-2">
+                          📚 Sources ({m.sources.length})
+                        </p>
+                        {m.sources.slice(0, 3).map((source: any, idx: number) => {
+                          // Prefer explicit source_url from Supabase row,
+                          // fall back to other common fields or metadata.
+                          const sourceUrl =
+                            source.source_url ||
+                            source.url ||
+                            source.metadata?.url ||
+                            source.metadata?.source ||
+                            source.metadata?.file_name ||
+                            undefined;
+
+                          const similarity = source.similarity ? `${(source.similarity * 100).toFixed(0)}% match` : '';
+                          
+                          return (
+                            <div 
+                              key={idx}
+                              className="bg-white border border-slate-200 rounded-xl p-3 flex items-start gap-3 group hover:border-emerald-400 transition-all cursor-pointer shadow-sm"
+                              onClick={() => sourceUrl && setPreviewSourceUrl(sourceUrl)}
+                            >
+                              <div className="p-2 bg-emerald-50 text-emerald-600 rounded-lg shrink-0">
+                                <FileText size={16} />
+                              </div>
+                              <div className="flex-1 overflow-hidden">
+                                <p className="text-xs font-bold text-slate-800 line-clamp-1">
+                                  {source.title ||
+                                   source.metadata?.title ||
+                                   source.metadata?.file_name ||
+                                   `Source ${idx + 1}`}
+                                </p>
+                                <p className="text-[10px] text-slate-500 truncate mt-0.5">
+                                  {similarity && (
+                                    <span className="text-emerald-600 font-semibold mr-2">
+                                      {similarity}
+                                    </span>
+                                  )}
+                                  {sourceUrl || 'Government database'}
+                                </p>
+                                {(source.summary || source.content) && (
+                                  <p className="text-[10px] text-slate-400 line-clamp-2 mt-1 italic">
+                                    {(source.summary || source.content).substring(0, 100)}...
+                                  </p>
+                                )}
+                              </div>
+                              {sourceUrl && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    window.open(sourceUrl, '_blank');
+                                  }}
+                                  className="p-1 rounded-md text-slate-300 hover:text-emerald-500 hover:bg-emerald-50 transition-colors shrink-0 mt-1"
+                                  title="Open in new window"
+                                >
+                                  <ExternalLink size={14} />
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {/* Inline document preview window */}
+                    {previewSourceUrl && (
+                      <div className="mt-4">
+                        <p className="text-xs font-bold text-slate-500 uppercase tracking-wide mb-2">
+                          Inline document preview
+                        </p>
+                        <div className="relative h-56 rounded-2xl border border-slate-200 overflow-hidden bg-white shadow-sm">
+                          <iframe
+                            src={previewSourceUrl}
+                            className="w-full h-full border-0"
+                            title="Source document preview"
+                          />
+                          <div className="absolute inset-x-0 bottom-0 flex items-center justify-between px-3 py-2 bg-gradient-to-t from-white/90 via-white/70 to-transparent">
+                            <span className="text-[10px] text-slate-500">
+                              Showing source inside chat
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => window.open(previewSourceUrl, '_blank')}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-semibold bg-slate-900 text-white hover:bg-emerald-600 transition-colors"
+                            >
+                              <ExternalLink size={12} />
+                              Full screen
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Legacy single source support */}
+                    {m.source && (!m.sources || m.sources.length === 0) && (
                       <div className="bg-white border border-slate-200 rounded-2xl p-4 flex items-center justify-between group hover:border-emerald-400 transition-all cursor-pointer shadow-sm">
                         <div className="flex items-center gap-3 overflow-hidden">
                           <div className="p-2.5 bg-emerald-50 text-emerald-600 rounded-xl">
@@ -237,8 +490,35 @@ const startListening = () => {
                           </>
                         )}
                       </button>
-                      <button className="flex items-center gap-2 bg-white border border-slate-200 text-slate-700 px-5 py-2.5 rounded-full text-sm font-bold hover:border-emerald-500 transition-all shadow-sm">
-                        <PlusCircle size={18} /> Simpler Version
+                      <button 
+                        onClick={() => {
+                          if (m.originalText) {
+                            // If already simplified, revert to original
+                            const updatedMessages = messages.map((msg, index) => {
+                              if (index === i) {
+                                return { ...msg, text: msg.originalText, originalText: undefined };
+                              }
+                              return msg;
+                            });
+                            setMessages(updatedMessages);
+                          } else {
+                            handleSimplify(i, m.text)
+                          }
+                        }}
+                        disabled={m.isSimplifying}
+                        className="flex items-center gap-2 bg-white border border-slate-200 text-slate-700 px-5 py-2.5 rounded-full text-sm font-bold hover:border-emerald-500 transition-all shadow-sm"
+                      >
+                        {m.isSimplifying ? (
+                          <>
+                            <Loader2 size={18} className="animate-spin" />
+                            Simplifying...
+                          </>
+                        ) : (
+                          <>
+                            <PlusCircle size={18} />
+                            {m.originalText ? 'Show Original' : 'Simpler Version'}
+                          </>
+                        )}
                       </button>
                     </div>
                   </div>
@@ -298,6 +578,59 @@ const startListening = () => {
             </p>
           </div>
         </footer>
+
+        {/* DEBUG PANEL */}
+        {showDebugPanel && (
+          <div className="fixed right-0 top-0 bottom-0 w-96 bg-slate-900 text-slate-100 shadow-2xl z-50 flex flex-col border-l border-slate-700">
+            <div className="p-4 border-b border-slate-700 flex items-center justify-between bg-slate-800">
+              <div className="flex items-center gap-2">
+                <Info size={18} className="text-purple-400" />
+                <h3 className="font-bold text-sm">Debug Console</h3>
+              </div>
+              <button 
+                onClick={() => setShowDebugPanel(false)}
+                className="p-2 hover:bg-slate-700 rounded-lg transition"
+              >
+                <X size={18} />
+              </button>
+            </div>
+            
+            <div className="flex-1 overflow-y-auto p-4 space-y-2 font-mono text-xs">
+              {currentDebugLogs.length > 0 ? (
+                currentDebugLogs.map((log, idx) => {
+                  // Determine log color based on content
+                  let colorClass = "text-slate-300";
+                  if (log.includes("✅") || log.includes("✓")) colorClass = "text-green-400";
+                  else if (log.includes("❌") || log.includes("Error")) colorClass = "text-red-400";
+                  else if (log.includes("⚠️")) colorClass = "text-yellow-400";
+                  else if (log.includes("🎯") || log.includes("Step")) colorClass = "text-blue-400";
+                  else if (log.includes("===")) colorClass = "text-purple-400";
+                  
+                  return (
+                    <div key={idx} className={`${colorClass} leading-relaxed whitespace-pre-wrap`}>
+                      {log}
+                    </div>
+                  );
+                })
+              ) : (
+                <div className="text-slate-500 text-center py-8">
+                  <Info size={32} className="mx-auto mb-2 opacity-50" />
+                  <p>No debug logs yet.</p>
+                  <p className="text-[10px] mt-1">Send a query to see pipeline execution steps.</p>
+                </div>
+              )}
+            </div>
+            
+            <div className="p-4 border-t border-slate-700 bg-slate-800">
+              <button 
+                onClick={() => setCurrentDebugLogs([])}
+                className="w-full px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-xs font-semibold transition"
+              >
+                Clear Logs
+              </button>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );
