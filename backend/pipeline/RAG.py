@@ -14,9 +14,8 @@ import re
 from typing import List, Dict, Any, Optional
 import json
 import time
-import requests
+import threading
 from datetime import datetime
-from urllib.parse import urlparse
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
@@ -39,14 +38,6 @@ try:
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
     print("⚠️  Transformers not installed. Install with: pip install transformers torch")
-
-# 🔧 CLOUD: Google Gemini Support
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
-    print("⚠️  Gemini not installed. Install with: pip install google-generativeai")
 
 # 🔧 CLOUD: Groq Support
 try:
@@ -94,18 +85,21 @@ SPACY_MODEL_MULTILINGUAL = 'xx_ent_wiki_sm'
 
 # ============================================================================
 # 🔧 HACKATHON: LLM Provider Selection
-# Options: 'hf_inference', 'openrouter', 'gemini', 'groq', 'huggingface', 'openai'
+# Options: 'hf_inference', 'groq', 'huggingface', 'openai'
 # ============================================================================
-# 🌟 TEMPORARY: Use OpenRouter free model as primary provider
-LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'openrouter').lower()  # Change based on your preference
+# Enable speed-first defaults for lower latency in production demos
+SPEED_MODE = os.getenv('SPEED_MODE', 'true').lower() in {'1', 'true', 'yes'}
+
+# Default to HF Inference now that OpenRouter/Gemini are removed
+LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'hf_inference').lower()  # Change based on your preference
 
 # Enable automatic fallback if primary provider fails
-ENABLE_FALLBACK = True
-FALLBACK_ORDER = ['hf_inference', 'openrouter', 'gemini', 'groq', 'huggingface']  # Try in this order
+ENABLE_FALLBACK = os.getenv('ENABLE_FALLBACK', 'true').lower() in {'1', 'true', 'yes'}
+FALLBACK_ORDER = ['groq', 'openai', 'hf_inference', 'huggingface']  # Try in this order
 
-# OpenAI LLM Model Selection
-# Options: 'gpt-3.5-turbo', 'gpt-4', 'gpt-4-turbo', 'gpt-4o'
-OPENAI_MODEL_NAME = 'gpt-3.5-turbo'
+# OpenAI-compatible LLM Model Selection
+# Examples: 'openai/gpt-oss-120b', 'gpt-4o', 'gpt-4.1-mini'
+OPENAI_MODEL_NAME = os.getenv('OPENAI_MODEL_NAME', 'openai/gpt-oss-120b')
 
 # ============================================================================
 # 🔧 HACKATHON: Southeast Asian LLM Models (Hugging Face)
@@ -139,12 +133,6 @@ USE_QUANTIZATION = True  # Set False if you have >16GB RAM
 # 🔧 CLOUD: Model Selection for Cloud Providers
 # ============================================================================
 
-# Google Gemini Models
-# 'gemini-2.0-flash-lite' - Best default for free-tier usage
-# 'gemini-2.0-flash-lite-001' - Version-pinned lite variant
-# 'gemini-2.0-flash' - Higher quality, typically tighter limits
-GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash-lite')
-
 # Groq Models (all FREE)
 # 'llama-3.3-70b-versatile' - Newest, best quality
 # 'llama-3.1-70b-versatile' - Stable, good performance
@@ -155,37 +143,29 @@ GROQ_MODEL = 'llama-3.3-70b-versatile'
 # Can use any public model on HF Hub
 HF_INFERENCE_MODEL = 'aisingapore/llama3-8b-cpt-sea-lionv2.1-instruct'
 
-# OpenRouter Models
-# Free model from your request
-OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'mistralai/mistral-small-3.1-24b-instruct:free')
-OPENROUTER_FALLBACK_MODEL = os.getenv('OPENROUTER_FALLBACK_MODEL', 'mistralai/mistral-small-3.1-24b-instruct:free')
-
 # ============================================================================
 # 🔧 CONFIGURABLE: API KEYS AND DATABASE CONNECTION
 # ============================================================================
 
 # Set your API keys here or via environment variables
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', 'YOUR_OPENAI_API_KEY')
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', 'YOUR_OPENROUTER_API_KEY')
+OPENROUTER_BASE_URL = os.getenv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1')
 SUPABASE_URL = os.getenv('SUPABASE_URL', 'YOUR_SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY', 'YOUR_SUPABASE_KEY')
 
 # 🔧 CLOUD: API Keys for Free Cloud Providers
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'YOUR_GEMINI_API_KEY')  # Get at: https://makersuite.google.com/app/apikey
 GROQ_API_KEY = os.getenv('GROQ_API_KEY', 'YOUR_GROQ_API_KEY')  # Get at: https://console.groq.com
 HF_TOKEN = os.getenv('HF_TOKEN', 'YOUR_HF_TOKEN')  # Get at: https://huggingface.co/settings/tokens
 
-# OpenRouter configuration
-DEFAULT_OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1/chat/completions'
-OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', 'YOUR_OPENROUTER_API_KEY')
-OPENROUTER_BASE_URL = os.getenv('OPENROUTER_BASE_URL', DEFAULT_OPENROUTER_BASE_URL)
-OPENROUTER_SITE_URL = os.getenv('OPENROUTER_SITE_URL', '')
-OPENROUTER_SITE_NAME = os.getenv('OPENROUTER_SITE_NAME', '')
-
 # Hugging Face API resilience settings
-HF_EMBEDDING_MAX_RETRIES = int(os.getenv('HF_EMBEDDING_MAX_RETRIES', '3'))
-HF_LLM_MAX_RETRIES = int(os.getenv('HF_LLM_MAX_RETRIES', '2'))
-HF_RETRY_DELAY_SECONDS = float(os.getenv('HF_RETRY_DELAY_SECONDS', '1.5'))
+HF_EMBEDDING_MAX_RETRIES = int(os.getenv('HF_EMBEDDING_MAX_RETRIES', '1' if SPEED_MODE else '3'))
+HF_LLM_MAX_RETRIES = int(os.getenv('HF_LLM_MAX_RETRIES', '2' if SPEED_MODE else '2'))
+HF_RETRY_DELAY_SECONDS = float(os.getenv('HF_RETRY_DELAY_SECONDS', '0.5' if SPEED_MODE else '1.5'))
 HF_EMBEDDING_WARMUP = os.getenv('HF_EMBEDDING_WARMUP', 'false').lower() in {'1', 'true', 'yes'}
+HF_EMBEDDING_TIMEOUT_SECONDS = float(os.getenv('HF_EMBEDDING_TIMEOUT_SECONDS', '4.0' if SPEED_MODE else '10.0'))
+HF_EMBEDDING_MAX_LATENCY_SECONDS = float(os.getenv('HF_EMBEDDING_MAX_LATENCY_SECONDS', '3.5' if SPEED_MODE else '8.0'))
+LOCAL_EMBEDDING_STANDBY = os.getenv('LOCAL_EMBEDDING_STANDBY', 'true' if SPEED_MODE else 'false').lower() in {'1', 'true', 'yes'}
 
 # ============================================================================
 # 🔧 CONFIGURABLE: VECTOR SEARCH PARAMETERS
@@ -211,16 +191,26 @@ NUM_BULLET_POINTS = '3-5'
 # Options: 'narrative', 'bullet', 'mixed'
 ANSWER_STYLE = os.getenv('ANSWER_STYLE', 'narrative').lower()
 
+# Controls how much reasoning/detail the final answer should include.
+# Options: 'concise', 'balanced', 'detailed'
+RESPONSE_DEPTH = os.getenv('RESPONSE_DEPTH', 'balanced').lower()
+
+# Set true to always end with a follow-up question.
+FORCE_FOLLOW_UP_QUESTION = os.getenv('FORCE_FOLLOW_UP_QUESTION', 'true').lower() in {'1', 'true', 'yes'}
+
+# Step-gating can add one extra turn; keep it off by default for direct guidance.
+ENABLE_STEP_GATE = os.getenv('ENABLE_STEP_GATE', 'false').lower() in {'1', 'true', 'yes'}
+
 # Reading level for simplification
 READING_LEVEL = '5th-grade'
 
 # Reduce chunk size before sending retrieved context to the LLM
-CHUNK_SUMMARY_MAX_CHARS = 900
-CHUNK_SUMMARY_MAX_SENTENCES = 4
-TOTAL_CONTEXT_MAX_CHARS = 3200
+CHUNK_SUMMARY_MAX_CHARS = 700 if SPEED_MODE else 900
+CHUNK_SUMMARY_MAX_SENTENCES = 3 if SPEED_MODE else 4
+TOTAL_CONTEXT_MAX_CHARS = 2200 if SPEED_MODE else 3200
 
 # Maximum tokens for LLM response
-MAX_TOKENS = 1000
+MAX_TOKENS = 550 if SPEED_MODE else 1000
 
 # Temperature for LLM (0-2, lower = more focused)
 LLM_TEMPERATURE = 0.7
@@ -321,6 +311,8 @@ class RAGPipeline:
         self.embedding_model = None
         self.embedding_client = None
         self.embedding_dim = None
+        self.embedding_fallback_active = False
+        self._embedding_local_lock = threading.Lock()
 
         print(f"📦 Initializing embeddings ({self.embedding_provider}): {EMBEDDING_MODEL_NAME}")
         if self.embedding_provider == 'hf_inference':
@@ -337,6 +329,7 @@ class RAGPipeline:
                     self.embedding_client = InferenceClient(
                         model=EMBEDDING_MODEL_NAME,
                         token=HF_TOKEN,
+                        timeout=HF_EMBEDDING_TIMEOUT_SECONDS,
                     )
                     if HF_EMBEDDING_WARMUP:
                         warmup_vec = self._get_hf_embedding_with_retry("Embedding warmup test")
@@ -349,11 +342,37 @@ class RAGPipeline:
                     print("   ℹ️  Falling back to local SentenceTransformer embeddings")
                     self.embedding_provider = 'local'
 
+        if self.embedding_provider == 'hf_inference' and LOCAL_EMBEDDING_STANDBY:
+            def _warm_local_standby() -> None:
+                try:
+                    print("   🔥 Preloading local embedding standby in background...")
+                    self._ensure_local_embedding_model()
+                    print("   ✓ Local embedding standby ready")
+                except Exception as e:
+                    print(f"   ⚠️  Local embedding standby preload skipped: {e}")
+
+            threading.Thread(target=_warm_local_standby, daemon=True).start()
+
         if self.embedding_provider == 'local':
             print(f"📦 Loading local embedding model: {EMBEDDING_MODEL_NAME}")
+            try:
+                # Prevent multiprocessing spawn issues in Python 3.13+ on Windows
+                import torch
+                torch.set_num_threads(2)
+            except Exception as e:
+                print(f"   ℹ️  Could not configure torch threading: {e}")
+            
             self.embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
             self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
             print(f"   ✓ Local embedding dimension: {self.embedding_dim}")
+            
+            # Warmup embedding model to cache in memory (startup warmup)
+            try:
+                print(f"   🔥 Warming up embedding model...")
+                _ = self.embedding_model.encode("warmup test query")
+                print(f"   ✓ Embedding model warmup complete")
+            except Exception as e:
+                print(f"   ⚠️  Warmup failed but model is ready: {e}")
         
         # Initialize SpaCy models
         print(f"📦 Loading SpaCy models...")
@@ -402,10 +421,8 @@ class RAGPipeline:
     def _get_llm_model_name(self, provider: str) -> str:
         """Return the configured model name for a provider."""
         model_map = {
-            'gemini': GEMINI_MODEL,
             'groq': GROQ_MODEL,
             'hf_inference': HF_INFERENCE_MODEL,
-            'openrouter': OPENROUTER_MODEL,
             'openai': OPENAI_MODEL_NAME,
             'huggingface': HUGGINGFACE_MODEL_NAME,
         }
@@ -417,35 +434,11 @@ class RAGPipeline:
         model_name = self._get_llm_model_name(resolved_provider)
         return f"provider={resolved_provider}, model={model_name}"
 
-    def _get_openrouter_base_url(self) -> str:
-        """Return a safe OpenRouter endpoint and fall back if misconfigured."""
-        candidate = (OPENROUTER_BASE_URL or '').strip()
-        if not candidate:
-            return DEFAULT_OPENROUTER_BASE_URL
-
-        parsed = urlparse(candidate)
-        if parsed.scheme != 'https' or parsed.netloc.lower() != 'openrouter.ai':
-            warning = (
-                f"[Step 5] ⚠️ Invalid OPENROUTER_BASE_URL '{candidate}'. "
-                f"Falling back to {DEFAULT_OPENROUTER_BASE_URL}"
-            )
-            self._log_debug(warning)
-            print(warning)
-            return DEFAULT_OPENROUTER_BASE_URL
-
-        return candidate
-
     def _init_llm_provider(self, provider: str):
         """Initialize the specified LLM provider"""
         self.active_llm_provider = provider
-        
-        if provider == 'gemini' and GEMINI_AVAILABLE:
-            print(f"🌟 Initializing Google Gemini: {GEMINI_MODEL}")
-            genai.configure(api_key=GEMINI_API_KEY)
-            self.gemini_model = genai.GenerativeModel(GEMINI_MODEL)
-            print(f"   ✓ Gemini initialized (Best for ASEAN multilingual!)")
-            
-        elif provider == 'groq' and GROQ_AVAILABLE:
+
+        if provider == 'groq' and GROQ_AVAILABLE:
             print(f"⚡ Initializing Groq: {GROQ_MODEL}")
             self.groq_client = Groq(api_key=GROQ_API_KEY)
             print(f"   ✓ Groq initialized (Ultra-fast inference!)")
@@ -454,17 +447,18 @@ class RAGPipeline:
             print(f"🤗 Initializing Hugging Face Inference API: {HF_INFERENCE_MODEL}")
             self.hf_inference_client = InferenceClient(token=HF_TOKEN)
             print(f"   ✓ HF Inference initialized (SEA-LION cloud access!)")
-
-        elif provider == 'openrouter':
-            if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == 'YOUR_OPENROUTER_API_KEY':
-                raise ValueError("OPENROUTER_API_KEY not configured. Set OPENROUTER_API_KEY in your .env file")
-            print(f"🛣️  Initializing OpenRouter: {OPENROUTER_MODEL}")
-            print("   ✓ OpenRouter initialized")
             
         elif provider == 'openai':
-            print(f"🤖 Initializing OpenAI client with model: {OPENAI_MODEL_NAME}")
-            self.openai_client = OpenAI(api_key=OPENAI_API_KEY)
-            print(f"   ✓ OpenAI initialized")
+            print(f"🤖 Initializing OpenAI-compatible client with model: {OPENAI_MODEL_NAME}")
+            using_openrouter = (
+                OPENROUTER_API_KEY and OPENROUTER_API_KEY != 'YOUR_OPENROUTER_API_KEY'
+            )
+            if using_openrouter:
+                self.openai_client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
+                print(f"   ✓ OpenAI-compatible client initialized via OpenRouter")
+            else:
+                self.openai_client = OpenAI(api_key=OPENAI_API_KEY)
+                print(f"   ✓ OpenAI client initialized")
             
         elif provider == 'huggingface' and TRANSFORMERS_AVAILABLE:
             print(f"💻 Loading Local SEA LLM: {SEA_MODEL_CHOICE} ({HUGGINGFACE_MODEL_NAME})")
@@ -493,9 +487,6 @@ class RAGPipeline:
             
         else:
             available = []
-            if OPENROUTER_API_KEY and OPENROUTER_API_KEY != 'YOUR_OPENROUTER_API_KEY':
-                available.append('openrouter')
-            if GEMINI_AVAILABLE: available.append('gemini')
             if GROQ_AVAILABLE: available.append('groq')
             if HF_INFERENCE_AVAILABLE: available.append('hf_inference')
             if TRANSFORMERS_AVAILABLE: available.append('huggingface')
@@ -504,7 +495,7 @@ class RAGPipeline:
             raise ValueError(
                 f"Provider '{provider}' not available or dependencies not installed.\n"
                 f"Available providers: {', '.join(available)}\n"
-                f"Install missing: pip install google-generativeai groq huggingface_hub"
+                f"Install missing: pip install groq huggingface_hub"
             )
         
         # Initialize Supabase client
@@ -531,6 +522,24 @@ class RAGPipeline:
         print(f"🔍 Step 1: Detecting language for query: '{text[:50]}...'")
         
         try:
+            # Special handling for very short words that langdetect struggles with
+            common_short_english = {
+                'yes', 'no', 'ok', 'okay', 'yep', 'nope', 'yeah', 'nah',
+                'sure', 'maybe', 'perhaps', 'likely', 'probably',
+                'true', 'false', 'correct', 'wrong', 'right', 'good', 'bad',
+                'thanks', 'thank you', 'welcome', 'hi', 'hello', 'hey', 'bye',
+                'continue', 'proceed', 'go ahead', 'please', 'ok thanks',
+            }
+            
+            text_normalized = text.strip().lower()
+            if text_normalized in common_short_english:
+                print(f"   ✓ Detected short English word: '{text_normalized}' (confidence: 1.00)")
+                return {
+                    'primary_language': 'en',
+                    'all_languages': [{'lang': 'en', 'probability': 1.0}],
+                    'confidence': 1.0
+                }
+            
             # Get primary language
             primary_lang = detect(text)
             
@@ -807,6 +816,38 @@ class RAGPipeline:
             "Embedding service is temporarily unavailable. "
             "Please retry in a few seconds."
         ) from last_error
+
+    def _ensure_local_embedding_model(self) -> None:
+        """Load local embedding model lazily for fallback scenarios."""
+        if self.embedding_model is not None:
+            return
+
+        with self._embedding_local_lock:
+            if self.embedding_model is not None:
+                return
+
+            print(f"📦 Loading local fallback embedding model: {EMBEDDING_MODEL_NAME}")
+            try:
+                import torch
+                torch.set_num_threads(2)
+            except Exception as e:
+                print(f"   ℹ️  Could not configure torch threading: {e}")
+
+            self.embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+            local_dim = self.embedding_model.get_sentence_embedding_dimension()
+            if self.embedding_dim is None:
+                self.embedding_dim = local_dim
+
+            try:
+                _ = self.embedding_model.encode("fallback warmup query")
+                print("   ✓ Local fallback embedding model ready")
+            except Exception as e:
+                print(f"   ⚠️  Local fallback warmup skipped: {e}")
+
+    def _get_local_embedding(self, query: str) -> List[float]:
+        """Generate embedding using local SentenceTransformer model."""
+        self._ensure_local_embedding_model()
+        return self.embedding_model.encode(query).tolist()
     
     def create_query_embedding(self, query: str) -> List[float]:
         """
@@ -821,9 +862,44 @@ class RAGPipeline:
         print(f"🔢 Step 2: Creating query embedding...")
 
         if self.embedding_provider == 'hf_inference' and self.embedding_client:
-            embedding = self._get_hf_embedding_with_retry(query)
+            try:
+                started = time.perf_counter()
+                embedding = self._get_hf_embedding_with_retry(query)
+                elapsed = time.perf_counter() - started
+
+                # If HF is consistently slow, switch to local for subsequent RAG requests.
+                if elapsed > HF_EMBEDDING_MAX_LATENCY_SECONDS:
+                    slow_msg = (
+                        f"[Step 2] ⚠️ HF embedding latency {elapsed:.2f}s exceeded "
+                        f"threshold {HF_EMBEDDING_MAX_LATENCY_SECONDS:.2f}s. "
+                        "Switching to local embeddings for faster RAG responses."
+                    )
+                    self._log_debug(slow_msg)
+                    print(f"   {slow_msg}")
+                    self._ensure_local_embedding_model()
+                    self.embedding_fallback_active = True
+                    self.embedding_provider = 'local'
+            except Exception as hf_error:
+                fallback_msg = (
+                    f"[Step 2] ⚠️ HF embeddings unavailable ({type(hf_error).__name__}). "
+                    "Falling back to local embedding model."
+                )
+                self._log_debug(fallback_msg)
+                print(f"   {fallback_msg}")
+
+                try:
+                    embedding = self._get_local_embedding(query)
+                    if not self.embedding_fallback_active:
+                        self.embedding_fallback_active = True
+                        self.embedding_provider = 'local'
+                        self._log_debug("[Step 2] ✅ Switched embedding provider to local fallback")
+                        print("   ✅ Switched embedding provider to local fallback")
+                except Exception as local_error:
+                    raise RuntimeError(
+                        "Both HF embedding service and local fallback embedding model failed."
+                    ) from local_error
         else:
-            embedding = self.embedding_model.encode(query).tolist()
+            embedding = self._get_local_embedding(query)
 
         if self.embedding_dim is None:
             self.embedding_dim = len(embedding)
@@ -889,7 +965,9 @@ class RAGPipeline:
         """Detect whether a query is procedural and should keep step-by-step guidance."""
         process_keywords = {
             'how', 'steps', 'apply', 'process', 'cara', 'bagaimana', 'langkah',
-            'proses', 'mohon', 'daftar', 'permohonan'
+            'proses', 'mohon', 'daftar', 'permohonan', 'report', 'complaint',
+            'proof', 'evidence', 'summarize', 'what happens', 'file', 'what can i do',
+            'what should i do', 'how do i'
         }
         lowered_query = (user_query or '').lower()
         return any(keyword in lowered_query for keyword in process_keywords)
@@ -1006,9 +1084,9 @@ Recent Conversation:
 Instructions:
 1. Respond in natural, friendly language in {target_language}.
 2. For greetings or thanks, reply warmly in 1-2 sentences.
-3. If the user seems to have a real question or need, gently ask one clarifying question to understand what they need help with (e.g., housing, education, financial aid, registration).
+3. If the user seems to have a real question or need, provide one short practical guidance step first, then ask one clarifying question.
 4. Do not invent government policies or procedures.
-5. Keep your reply short (2-4 sentences maximum).
+5. Keep your reply short (2-4 sentences maximum) and action-oriented.
 6. Do not start with stock phrases like \"Here's a helpful response\" or \"Certainly!\".
 """
 
@@ -1068,6 +1146,12 @@ Instructions:
         
         # Decide if the user is asking a process/how-to question.
         is_process_question = self._is_process_question(user_query)
+        lowered_query = (user_query or '').lower()
+        labor_keywords = {
+            'overtime', 'salary', 'wage', 'unpaid', 'employer', 'boss', 'passport',
+            'work permit', 'labour', 'labor', 'complaint', 'report', 'evidence', 'proof'
+        }
+        labor_mode = any(keyword in lowered_query for keyword in labor_keywords)
 
         if ANSWER_STYLE == 'bullet':
             response_format = (
@@ -1083,17 +1167,32 @@ Instructions:
             )
         elif is_process_question:
             response_format = (
-                "Use a short introduction in plain language, then provide 3-5 numbered steps in order. "
+                "Use a short introduction in plain language, then provide 3-5 steps using numbered points or bullet points. "
                 "End with one gentle follow-up question that helps the user continue."
             )
         else:
-            response_format = (
-                "Default to natural paragraph style, not bullet-heavy formatting. "
-                "Use this structure: (1) direct answer in 1-2 sentences, "
-                "(2) what the user should do next, "
-                "(3) what to prepare if relevant, "
-                "(4) one short follow-up question."
-            )
+            if RESPONSE_DEPTH == 'concise':
+                response_format = (
+                    "Default to natural paragraph style, not bullet-heavy formatting. "
+                    "Give a direct answer first in 1-2 sentences, then one concrete next action. "
+                    "Keep total length to 3-4 sentences."
+                )
+            elif RESPONSE_DEPTH == 'detailed':
+                response_format = (
+                    "Default to natural paragraph style, not bullet-heavy formatting. "
+                    "Structure your answer into short paragraphs covering: "
+                    "(1) direct answer, "
+                    "(2) why this applies to the user using source-backed facts, "
+                    "(3) what the user should do now, "
+                    "(4) what documents or checks to prepare if relevant."
+                )
+            else:
+                response_format = (
+                    "Default to natural paragraph style, not bullet-heavy formatting. "
+                    "Use this structure: (1) direct answer in 1-2 sentences, "
+                    "(2) short explanation of why this applies using source-backed details, "
+                    "(3) what the user should do next."
+                )
 
         list_format_guardrail = ""
         if ANSWER_STYLE == 'narrative' and not is_process_question:
@@ -1101,6 +1200,49 @@ Instructions:
                 "Do NOT use bullet points, numbered lists, markdown list markers, or list-style formatting. "
                 "Write in short, plain paragraphs suitable for low-literacy users."
             )
+
+        labor_mode_guardrail = ""
+        if labor_mode:
+            labor_mode_guardrail = """
+Labour-rights guidance requirements:
+- Use practical worker-safety guidance in simple language.
+- Explicitly mention worker rights when fear, threats, or retaliation is discussed.
+- If overtime is discussed, explain that work beyond normal hours is overtime and should be paid at a higher rate.
+- If overtime is discussed, also advise the user to keep records of working hours.
+- If unpaid salary is discussed, include: collect proof, contact Labour Department, submit a complaint.
+- If unpaid salary is discussed, explicitly state employers must pay wages on time.
+- If passport retention is discussed, state workers should keep personal documents and can seek help from authorities/support centers.
+- If retaliation fear is discussed, reassure the user and mention workers should not be punished for reporting violations.
+- If asked about evidence, include all of these examples explicitly: work schedule, employer messages, salary records, and photos or notes.
+- If asked what happens after complaint, mention investigation, request for evidence, and possible order to pay owed wages.
+- When location/help is asked, mention Labour Department and also mention migrant worker support organizations or help centers.
+- If the question asks "what can I do" or asks for a summary of next actions, give a clear checklist with numbered steps.
+- For a summary of next actions, include this checklist content: record hours/unpaid wages, keep proof/messages, contact Labour Department, submit complaint, seek migrant worker support organization/NGO help.
+"""
+
+        few_shot_examples = ""
+        if is_process_question:
+            few_shot_examples = """
+    Few-shot examples (style guide only, do not copy facts):
+    Example A (procedural):
+    User: "How do I report unpaid salary?"
+    Assistant: "You can report this in 4 steps. [S1]\n1) Collect proof of unpaid wages, such as payslips or messages. [S1]\n2) Write down dates and amounts owed. [S2]\n3) Contact the Labour Department and submit a complaint form. [S2]\n4) Keep your case reference number and follow up. [S2]\nWould you like a checklist you can bring to the office?"
+
+    Example B (procedural):
+    User: "What proof should I prepare?"
+    Assistant: "Bring any evidence you have: work schedule, employer messages, salary records, and notes of hours worked. [S1] If one item is missing, submit what you have and explain clearly. [S2] Would you like me to format this as a one-page checklist?"
+    """
+        else:
+            few_shot_examples = """
+    Few-shot examples (style guide only, do not copy facts):
+    Example A (general inquiry):
+    User: "I am scared and do not know where to start."
+    Assistant: "You can start by writing down what happened and keeping any messages or documents you already have. [S1] After that, contact the nearest Labour Department counter for guidance on your next step. [S2] Would you like help finding the closest office?"
+
+    Example B (general inquiry):
+    User: "My boss keeps my passport."
+    Assistant: "Your passport is your personal document and you should keep it with you. [S1] Ask for it back politely and seek help from the Labour Department or a migrant support center if needed. [S2] Do you want a simple script you can use when asking for it back?"
+    """
 
         prompt = f"""You are CivicGuide, an inclusive public-service assistant.
 
@@ -1119,6 +1261,10 @@ Recent Conversation:
 Retrieved Official Context:
 {context_text}
 
+{few_shot_examples}
+
+{labor_mode_guardrail}
+
 Instructions:
 1. Use retrieved context as evidence. Do not copy large chunks verbatim.
 2. Use plain language at approximately {READING_LEVEL} reading level. Keep sentences short and clear.
@@ -1133,6 +1279,8 @@ Instructions:
 11. Avoid sounding like a template. Do not add decorative titles or headings unless they are needed to explain steps clearly.
 12. If the user is asking a follow-up question, use the recent conversation to resolve references like "it", "that", or "the deadline" before answering.
 13. When you use information from a source, add an inline citation tag like [S1] or [S2] immediately after the relevant sentence. Use the source numbers provided in the Retrieved Official Context above.
+14. Prefer specific facts from the context (for example, eligibility criteria, timelines, or document names) over generic advice when such facts are available.
+15. Think through the answer internally, but output only the final answer without showing hidden reasoning.
 
 Before finalizing, check:
 - Can a 12-year-old understand this answer?
@@ -1299,11 +1447,7 @@ Do not simply repeat document snippets. Synthesize them into one helpful answer.
     
     def _call_llm_provider(self, provider: str, prompt: str) -> str:
         """Route to specific provider's LLM call"""
-        if provider == 'gemini':
-            return self._call_gemini_llm(prompt)
-        elif provider == 'openrouter':
-            return self._call_openrouter_llm(prompt)
-        elif provider == 'groq':
+        if provider == 'groq':
             return self._call_groq_llm(prompt)
         elif provider == 'hf_inference':
             return self._call_hf_inference_llm(prompt)
@@ -1313,45 +1457,6 @@ Do not simply repeat document snippets. Synthesize them into one helpful answer.
             return self._call_huggingface_llm(prompt)
         else:
             raise ValueError(f"Unknown provider: {provider}")
-    
-    def _call_gemini_llm(self, prompt: str) -> str:
-        """Call Google Gemini API (Best for ASEAN multilingual)"""
-        print(f"🌟 Step 5: Calling Google Gemini ({GEMINI_MODEL})...")
-        self._log_debug(f"[Step 5] 🌟 Using Gemini: {GEMINI_MODEL}")
-        
-        try:
-            # Check if API key is valid
-            if not GEMINI_API_KEY or GEMINI_API_KEY == 'YOUR_GEMINI_API_KEY':
-                error = "GEMINI_API_KEY not configured. Get your key at: https://makersuite.google.com/app/apikey"
-                self._log_debug(f"[Step 5] ❌ {error}")
-                raise ValueError(error)
-            
-            self._log_debug(f"[Step 5] 📡 Sending request to Gemini API...")
-            
-            # Generate response with Gemini
-            response = self.gemini_model.generate_content(
-                prompt,
-                generation_config=genai.GenerationConfig(
-                    max_output_tokens=MAX_TOKENS,
-                    temperature=LLM_TEMPERATURE,
-                )
-            )
-            
-            answer = response.text
-            self._log_debug(f"[Step 5] ✓ Gemini response: {len(answer)} chars")
-            print(f"   ✓ Gemini response generated ({len(answer)} characters)")
-            print(f"   ℹ️  Provider: Google Gemini (Excellent ASEAN dialect support!)")
-            return answer
-            
-        except Exception as e:
-            error_details = f"Gemini API failed: {type(e).__name__}: {str(e)}"
-            self._log_debug(f"[Step 5] ❌ {error_details}")
-            print(f"   ⚠️  {error_details}")
-            
-            if "API_KEY" in str(e).upper() or "401" in str(e):
-                self._log_debug(f"[Step 5] 💡 Fix: Check your GEMINI_API_KEY in .env file")
-            
-            raise
     
     def _call_groq_llm(self, prompt: str) -> str:
         """Call Groq API (Ultra-fast inference)"""
@@ -1400,91 +1505,7 @@ Do not simply repeat document snippets. Synthesize them into one helpful answer.
             
             raise
 
-    def _call_openrouter_llm(self, prompt: str) -> str:
-        """Call OpenRouter chat completions API using a free model."""
-        print(f"🛣️  Step 5: Calling OpenRouter ({OPENROUTER_MODEL})...")
-        self._log_debug(f"[Step 5] 🛣️  Using OpenRouter: {OPENROUTER_MODEL}")
 
-        try:
-            if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == 'YOUR_OPENROUTER_API_KEY':
-                error = "OPENROUTER_API_KEY not configured. Set OPENROUTER_API_KEY in your .env file"
-                self._log_debug(f"[Step 5] ❌ {error}")
-                raise ValueError(error)
-
-            headers = {
-                'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-                'Content-Type': 'application/json',
-            }
-            if OPENROUTER_SITE_URL:
-                headers['HTTP-Referer'] = OPENROUTER_SITE_URL
-            if OPENROUTER_SITE_NAME:
-                headers['X-OpenRouter-Title'] = OPENROUTER_SITE_NAME
-
-            openrouter_url = self._get_openrouter_base_url()
-
-            def _post_openrouter(model_name: str) -> requests.Response:
-                payload = {
-                    'model': model_name,
-                    'messages': [
-                        {
-                            'role': 'user',
-                            'content': prompt,
-                        }
-                    ],
-                    'max_tokens': MAX_TOKENS,
-                    'temperature': LLM_TEMPERATURE,
-                }
-                self._log_debug(f'[Step 5] 📡 Sending request to OpenRouter API: {openrouter_url} (model={model_name})')
-                print(f'   📡 OpenRouter endpoint: {openrouter_url} (model={model_name})')
-                return requests.post(
-                    openrouter_url,
-                    headers=headers,
-                    data=json.dumps(payload),
-                    timeout=120,
-                )
-
-            response = _post_openrouter(OPENROUTER_MODEL)
-
-            if response.status_code == 404 and OPENROUTER_FALLBACK_MODEL and OPENROUTER_FALLBACK_MODEL != OPENROUTER_MODEL:
-                preview = (response.text or '').strip().replace('\n', ' ')[:280]
-                self._log_debug(
-                    f"[Step 5] ⚠️ OpenRouter model '{OPENROUTER_MODEL}' returned 404. "
-                    f"Retrying with fallback model '{OPENROUTER_FALLBACK_MODEL}'. Details: {preview}"
-                )
-                print(f"   ⚠️  Model '{OPENROUTER_MODEL}' returned 404. Retrying with '{OPENROUTER_FALLBACK_MODEL}'...")
-                response = _post_openrouter(OPENROUTER_FALLBACK_MODEL)
-
-            response.raise_for_status()
-
-            data = response.json()
-            answer = data['choices'][0]['message']['content']
-            self._log_debug(f"[Step 5] ✓ OpenRouter response: {len(answer)} chars")
-            print(f"   ✓ OpenRouter response generated ({len(answer)} characters)")
-            return answer
-
-        except requests.HTTPError as e:
-            status_code = e.response.status_code if e.response is not None else 'unknown'
-            body_preview = ''
-            if e.response is not None and e.response.text:
-                body_preview = e.response.text.strip().replace('\n', ' ')[:500]
-            error_details = (
-                f"OpenRouter API failed at {self._get_openrouter_base_url()}: "
-                f"HTTP {status_code}: {str(e)}"
-            )
-            self._log_debug(f"[Step 5] ❌ {error_details}")
-            if body_preview:
-                self._log_debug(f"[Step 5] ❌ OpenRouter response body: {body_preview}")
-            print(f"   ⚠️  {error_details}")
-            if body_preview:
-                print(f"   ⚠️  OpenRouter body: {body_preview}")
-            raise
-
-        except Exception as e:
-            error_details = f"OpenRouter API failed at {self._get_openrouter_base_url()}: {type(e).__name__}: {str(e)}"
-            self._log_debug(f"[Step 5] ❌ {error_details}")
-            print(f"   ⚠️  {error_details}")
-            raise
-    
     def _call_hf_inference_llm(self, prompt: str) -> str:
         """Call Hugging Face Inference API (Cloud SEA models)"""
         print(f"🤗 Step 5: Calling HF Inference ({HF_INFERENCE_MODEL.split('/')[-1]})...")
@@ -1555,9 +1576,20 @@ Do not simply repeat document snippets. Synthesize them into one helpful answer.
     
     def _call_openai_llm(self, prompt: str) -> str:
         """Call OpenAI GPT models"""
-        print(f"🤖 Step 5: Calling OpenAI LLM ({OPENAI_MODEL_NAME})...")
+        print(f"🤖 Step 5: Calling OpenAI-compatible LLM ({OPENAI_MODEL_NAME})...")
+        self._log_debug(f"[Step 5] 🤖 Using OpenAI-compatible model: {OPENAI_MODEL_NAME}")
         
         try:
+            has_openai_key = OPENAI_API_KEY and OPENAI_API_KEY != 'YOUR_OPENAI_API_KEY'
+            has_openrouter_key = OPENROUTER_API_KEY and OPENROUTER_API_KEY != 'YOUR_OPENROUTER_API_KEY'
+            if not has_openai_key and not has_openrouter_key:
+                error = (
+                    "No OpenAI-compatible API key configured. "
+                    "Set OPENAI_API_KEY or OPENROUTER_API_KEY in your .env file."
+                )
+                self._log_debug(f"[Step 5] ❌ {error}")
+                raise ValueError(error)
+
             response = self.openai_client.chat.completions.create(
                 model=OPENAI_MODEL_NAME,
                 messages=[
@@ -1579,13 +1611,16 @@ Do not simply repeat document snippets. Synthesize them into one helpful answer.
             )
             
             answer = response.choices[0].message.content
+            self._log_debug(f"[Step 5] ✓ OpenAI-compatible response: {len(answer)} chars")
             print(f"   ✓ LLM response generated ({len(answer)} characters)")
             print(f"   ℹ️  Tokens used: {response.usage.total_tokens}")
             return answer
             
         except Exception as e:
-            print(f"   ⚠️  OpenAI LLM call failed: {e}")
-            return "Sorry, I couldn't generate a response at this time."
+            error_details = f"OpenAI-compatible LLM call failed: {type(e).__name__}: {e}"
+            self._log_debug(f"[Step 5] ❌ {error_details}")
+            print(f"   ⚠️  {error_details}")
+            raise
     
     def _call_huggingface_llm(self, prompt: str) -> str:
         """Call Hugging Face Southeast Asian LLM models"""
@@ -1753,7 +1788,7 @@ You are a helpful assistant specializing in providing simplified information to 
                     "If online forms are difficult, visit the nearest government service counter for walk-in help."
                 )
 
-        if not re.search(r"[?]\s*$", answer_text.strip()):
+        if FORCE_FOLLOW_UP_QUESTION and not re.search(r"[?]\s*$", answer_text.strip()) and '[STEP_GATE]' not in answer_text:
             answer_text = f"{answer_text.rstrip()}\n\nWould you like help with the next step?"
 
         if ANSWER_STYLE != 'bullet':
@@ -2135,9 +2170,9 @@ Simplified text:
             self._log_debug("[Step 4] 📝 Preparing LLM prompt...")
             is_process_question = self._is_process_question(user_query)
 
-            # Step-gating: first encounter of a process question → overview only
+            # Step-gating is optional; default is direct step-by-step response.
             step_confirmed = self._detect_step_confirmation(user_query, conversation_history)
-            use_step_gate = is_process_question and not step_confirmed
+            use_step_gate = ENABLE_STEP_GATE and is_process_question and not step_confirmed
 
             prompt = self.prepare_llm_prompt(
                 query_for_retrieval,  # Use translated query
@@ -2216,8 +2251,20 @@ Simplified text:
             final_response['rag_used'] = True
             final_response['evidence'] = evidence
 
-            # Add sources for frontend display
-            final_response['sources'] = retrieved_chunks
+            # Add sources for frontend display with all required fields
+            formatted_sources = []
+            for chunk in retrieved_chunks:
+                formatted_source = {
+                    'title': chunk.get('title', 'Document'),
+                    'content': chunk.get('summary') or chunk.get('content') or chunk.get('text', ''),
+                    'summary': chunk.get('summary') or chunk.get('content') or chunk.get('text', ''),
+                    'source_url': chunk.get('source_url') or chunk.get('url', ''),
+                    'url': chunk.get('source_url') or chunk.get('url', ''),
+                    'similarity': chunk.get('similarity'),
+                    'language': chunk.get('language', 'unknown'),
+                }
+                formatted_sources.append(formatted_source)
+            final_response['sources'] = formatted_sources if formatted_sources else []
             
             # Add debug logs to response
             final_response['debug_logs'] = self.debug_logs

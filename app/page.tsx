@@ -50,6 +50,16 @@ type ConversationRecord = {
   }>;
 };
 
+type BackendHealthPayload = {
+  status?: string;
+  backend?: {
+    rag_initialized?: boolean;
+    warmup_status?: string;
+    warmup_error?: string | null;
+    message?: string;
+  };
+};
+
 const MAX_HISTORY_MESSAGES = 6;
 const CHAT_HISTORY_STORAGE_KEY = 'chat_history';
 const CONVERSATION_ID_STORAGE_KEY = 'current_conversation_id';
@@ -95,6 +105,7 @@ export default function InclusiveApp() {
   const [previewSourceUrl, setPreviewSourceUrl] = useState<string | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const [isTranscribing, setIsTranscribing] = useState(false);
+  const [warmupStatus, setWarmupStatus] = useState<'checking' | 'warming' | 'ready' | 'failed'>('checking');
 
   const syncLocalMessages = (nextMessages: ChatMessage[]) => {
     setMessages(nextMessages);
@@ -182,6 +193,21 @@ export default function InclusiveApp() {
     let isMounted = true;
 
     const bootstrapConversation = async () => {
+      // Show existing local history immediately while server sync happens.
+      const savedMessages = localStorage.getItem(CHAT_HISTORY_STORAGE_KEY);
+      if (savedMessages) {
+        try {
+          const parsedMessages = JSON.parse(savedMessages);
+          if (Array.isArray(parsedMessages) && parsedMessages.length > 0) {
+            setMessages(parsedMessages);
+          }
+        } catch (error) {
+          console.warn('Failed to parse saved chat history:', error);
+        }
+      } else {
+        setMessages([getWelcomeMessage()]);
+      }
+
       const savedConversationId = localStorage.getItem(CONVERSATION_ID_STORAGE_KEY);
 
       try {
@@ -204,12 +230,7 @@ export default function InclusiveApp() {
         await createConversation();
       } catch (error) {
         console.warn('Conversation bootstrap fallback activated:', error);
-        const savedMessages = localStorage.getItem(CHAT_HISTORY_STORAGE_KEY);
-        if (savedMessages) {
-          setMessages(JSON.parse(savedMessages));
-        } else {
-          setMessages([getWelcomeMessage()]);
-        }
+        // Keep already hydrated local history shown to user.
       }
     };
 
@@ -217,6 +238,53 @@ export default function InclusiveApp() {
 
     return () => {
       isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+    let pollId: ReturnType<typeof setInterval> | null = null;
+
+    const checkBackendWarmup = async () => {
+      try {
+        const response = await fetch('/api/chat', { method: 'GET', cache: 'no-store' });
+        const result: BackendHealthPayload = await response.json();
+
+        if (!isMounted) return;
+
+        const backend = result.backend;
+        const status = backend?.warmup_status;
+        const ragReady = backend?.rag_initialized === true;
+
+        if (ragReady || status === 'ready') {
+          setWarmupStatus('ready');
+          if (pollId) {
+            clearInterval(pollId);
+            pollId = null;
+          }
+          return;
+        }
+
+        if (status === 'failed') {
+          setWarmupStatus('failed');
+          return;
+        }
+
+        setWarmupStatus('warming');
+      } catch {
+        if (!isMounted) return;
+        setWarmupStatus('checking');
+      }
+    };
+
+    checkBackendWarmup();
+    pollId = setInterval(checkBackendWarmup, 3000);
+
+    return () => {
+      isMounted = false;
+      if (pollId) {
+        clearInterval(pollId);
+      }
     };
   }, []);
 
@@ -346,7 +414,9 @@ export default function InclusiveApp() {
       let activeConversationId = currentConversationId;
       if (!activeConversationId) {
         const createdConversation = await createConversation();
-        activeConversationId = createdConversation.id;
+        if (createdConversation) {
+          activeConversationId = createdConversation.id;
+        }
       }
 
       // Call Python RAG backend via Next.js API route
@@ -519,6 +589,22 @@ export default function InclusiveApp() {
           </div>
           
           <div className="flex items-center gap-3">
+            {warmupStatus !== 'ready' && (
+              <div
+                className={`px-3 py-1.5 rounded-full text-[11px] font-semibold border ${
+                  warmupStatus === 'failed'
+                    ? 'bg-rose-50 text-rose-700 border-rose-200'
+                    : 'bg-amber-50 text-amber-700 border-amber-200'
+                }`}
+                title={
+                  warmupStatus === 'failed'
+                    ? 'Model warmup failed. First message may be slower while retrying.'
+                    : 'Preparing AI models. First response may be slower.'
+                }
+              >
+                {warmupStatus === 'failed' ? 'Model warmup failed' : 'Warming up model...'}
+              </div>
+            )}
             {/* Debug Panel Toggle */}
             <button 
               onClick={() => setShowDebugPanel(!showDebugPanel)}
@@ -570,13 +656,13 @@ export default function InclusiveApp() {
 
                 {m.role === 'assistant' && (
                   <div className="mt-6 space-y-4">
-                    {/* Display all sources from RAG */}
-                    {m.sources && m.sources.length > 0 && (
+                    {/* Display all sources from RAG - show prominently when RAG was used */}
+                    {(m.sources && m.sources.length > 0) && (
                       <div className="space-y-2">
                         <p className="text-xs font-bold text-slate-500 uppercase tracking-wide mb-2">
                           📚 Sources ({m.sources.length})
                         </p>
-                        {m.sources.slice(0, 3).map((source: any, idx: number) => {
+                        {m.sources.map((source: any, idx: number) => {
                           // Prefer explicit source_url from Supabase row,
                           // fall back to other common fields or metadata.
                           const sourceUrl =

@@ -8,6 +8,7 @@ import sys
 import io
 import os
 import shutil
+import threading
 
 # Fix Unicode encoding for Windows console
 if sys.platform == 'win32':
@@ -71,20 +72,36 @@ app.add_middleware(
 
 # Initialize RAG Pipeline (loads on first use)
 rag_pipeline = None
+pipeline_init_lock = threading.Lock()
 conversation_store = ConversationStore()
+warmup_state = {
+    "status": "starting",  # starting | warming | ready | failed
+    "error": None,
+}
 
 def get_rag_pipeline():
     """Lazy load RAG pipeline on first use"""
-    global rag_pipeline, RAGPipeline
-    if rag_pipeline is None:
+    global rag_pipeline, RAGPipeline, warmup_state
+    if rag_pipeline is not None:
+        return rag_pipeline
+
+    with pipeline_init_lock:
+        if rag_pipeline is not None:
+            return rag_pipeline
+
         try:
             if RAGPipeline is None:
                 from pipeline.RAG import RAGPipeline as RAGPipelineClass
                 RAGPipeline = RAGPipelineClass
             print("🚀 Initializing RAG Pipeline...")
+            warmup_state["status"] = "warming"
+            warmup_state["error"] = None
             rag_pipeline = RAGPipeline()
+            warmup_state["status"] = "ready"
             print("✅ RAG Pipeline initialized successfully")
         except Exception as e:
+            warmup_state["status"] = "failed"
+            warmup_state["error"] = str(e)
             print(f"❌ Failed to initialize RAG pipeline: {e}")
             raise HTTPException(
                 status_code=500,
@@ -95,13 +112,34 @@ def get_rag_pipeline():
 
 @app.on_event("startup")
 async def preload_rag_pipeline():
-    """Warm up pipeline at server boot to avoid first-request cold start."""
-    try:
-        get_rag_pipeline()
-        print("✅ Startup preload completed")
-    except Exception as e:
-        # Keep API alive; first request will surface detailed initialization errors.
-        print(f"⚠️  Startup preload skipped: {e}")
+    """Warm up pipeline in the background so startup endpoints stay responsive."""
+
+    def _background_warmup() -> None:
+        global warmup_state
+        print("\n" + "=" * 70)
+        print("🔥 WARMUP PHASE: PRE-LOADING ALL MODELS IN BACKGROUND")
+        print("=" * 70)
+        try:
+            warmup_state["status"] = "warming"
+            warmup_state["error"] = None
+            print("⏱️  Loading embedding model, translation model, LLM...")
+            pipeline = get_rag_pipeline()
+
+            print("\n📊 Running embedding warmup...")
+            test_embedding = pipeline.create_query_embedding("test warmup query")
+            print(f"   ✓ Embedding warmup successful (dimension: {len(test_embedding)})")
+
+            warmup_state["status"] = "ready"
+            print("\n✅ Background warmup completed")
+            print("=" * 70 + "\n")
+        except Exception as e:
+            warmup_state["status"] = "failed"
+            warmup_state["error"] = str(e)
+            print(f"\n⚠️  Background warmup failed: {e}")
+            print("   Pipeline will initialize on first chat request.")
+            print("=" * 70 + "\n")
+
+    threading.Thread(target=_background_warmup, daemon=True).start()
 
 
 # ============================================================================
@@ -203,6 +241,8 @@ class HealthResponse(BaseModel):
     """Health check response"""
     status: str
     rag_initialized: bool
+    warmup_status: str
+    warmup_error: Optional[str] = None
     message: str
 
 
@@ -216,6 +256,8 @@ async def root():
     return {
         "status": "online",
         "rag_initialized": rag_pipeline is not None,
+        "warmup_status": warmup_state["status"],
+        "warmup_error": warmup_state["error"],
         "message": "Multilingual RAG Bot API is running"
     }
 
@@ -223,10 +265,19 @@ async def root():
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Detailed health check"""
+    if warmup_state["status"] == "ready":
+        message = "RAG pipeline ready"
+    elif warmup_state["status"] == "failed":
+        message = "RAG warmup failed; backend will retry on first query"
+    else:
+        message = "RAG warmup in progress"
+
     return {
         "status": "healthy",
         "rag_initialized": rag_pipeline is not None,
-        "message": "RAG pipeline will load on first query" if rag_pipeline is None else "RAG pipeline ready"
+        "warmup_status": warmup_state["status"],
+        "warmup_error": warmup_state["error"],
+        "message": message,
     }
 
 @app.post("/transcribe")
@@ -289,8 +340,6 @@ async def chat(request: QueryRequest):
             {"role": message["role"], "text": message["text"]}
             for message in conversation.get("messages", [])[-6:]
         ]
-
-        conversation_store.append_message(conversation_id, "user", request.query)
 
         # When server has no stored history, use client-provided history as fallback
         # (important for step-gate confirmation detection when conversation_id is absent)
@@ -452,19 +501,35 @@ async def supported_languages():
 # ============================================================================
 
 if __name__ == "__main__":
+    # Fix multiprocessing spawn issues in Python 3.13+ on Windows
+    import multiprocessing
+    if sys.platform == 'win32':
+        try:
+            # Use 'spawn' method for Windows (safest for libraries like sentence-transformers)
+            multiprocessing.set_start_method('spawn', force=True)
+        except RuntimeError:
+            pass  # Already set in this process
+    
+    # Enable faster model loading at startup
+    os.environ.setdefault('HF_HUB_OFFLINE', 'false')  # Use cached models when available
+    
     # Get port from environment or default to 8000
     port = int(os.getenv("PORT", 8000))
     
-    print("=" * 60)
+    # Check if running in DEV or PROD mode
+    dev_mode = os.getenv("DEV_MODE", "true").lower() in {"1", "true", "yes"}
+    
+    print("\n" + "=" * 60)
     print(f"  Multilingual RAG Bot API Server")
     print(f"  http://localhost:{port}")
     print(f"  Docs: http://localhost:{port}/docs")
-    print("=" * 60)
+    print(f"  Mode: {'🔧 DEVELOPMENT (reload enabled)' if dev_mode else '🚀 PRODUCTION (no reload)'}")
+    print("=" * 60 + "\n")
     
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=port,
-        reload=True,  # Auto-reload on code changes
+        reload=dev_mode,  # Only reload in dev mode to avoid cold starts in production
         log_level="info"
     )
