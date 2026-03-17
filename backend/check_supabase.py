@@ -14,6 +14,7 @@ load_dotenv()
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 EMBEDDINGS_TABLE = os.getenv('EMBEDDINGS_TABLE_NAME', 'embeddings')
+EXPECTED_EMBEDDING_DIM = int(os.getenv('EMBEDDING_DIM', '1024'))
 
 print("=" * 60)
 print("Checking Supabase Database Status")
@@ -66,7 +67,7 @@ except Exception as e:
 print(f"\n🔍 Checking RPC function: match_documents")
 try:
     # Try calling the function with dummy data
-    test_embedding = [0.0] * 384  # Dummy embedding
+    test_embedding = [0.0] * EXPECTED_EMBEDDING_DIM  # Dummy embedding
     response = supabase.rpc(
         'match_documents',
         {
@@ -84,7 +85,7 @@ except Exception as e:
         print("\n   💡 You need to create this function in Supabase SQL Editor:")
         print("""
    CREATE OR REPLACE FUNCTION match_documents (
-     query_embedding vector(384),
+         query_embedding vector(1024),
      match_count int DEFAULT 5,
      similarity_threshold float DEFAULT 0.7
    )
@@ -112,6 +113,9 @@ except Exception as e:
         """)
     else:
         print(f"   ⚠️  Error testing function: {error_msg}")
+        if 'different vector dimensions' in error_msg.lower():
+            print("   💡 Detected vector size mismatch.")
+            print("      Update match_documents to use vector(1024) for BAAI/bge-m3.")
 
 print("\n" + "=" * 60)
 print("Diagnosis Complete")

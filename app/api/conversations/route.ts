@@ -14,7 +14,6 @@ function callPythonApi(path: string, method: 'GET' | 'POST', body?: unknown): Pr
   const baseUrl = new URL(PYTHON_API_URL);
   const isHttps = baseUrl.protocol === 'https:';
   const client = isHttps ? https : http;
-
   const payload = body ? JSON.stringify(body) : undefined;
   const requestPath = `${baseUrl.pathname.replace(/\/$/, '')}${path}`;
 
@@ -33,18 +32,14 @@ function callPythonApi(path: string, method: 'GET' | 'POST', body?: unknown): Pr
       },
       (res) => {
         const chunks: Buffer[] = [];
-
         res.on('data', (chunk) => {
           chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
         });
-
         res.on('end', () => {
           const raw = Buffer.concat(chunks).toString('utf-8');
           const status = res.statusCode || 500;
-
           try {
-            const parsed = raw ? JSON.parse(raw) : null;
-            resolve({ status, data: parsed });
+            resolve({ status, data: raw ? JSON.parse(raw) : null });
           } catch {
             resolve({ status, data: { raw } });
           }
@@ -56,76 +51,52 @@ function callPythonApi(path: string, method: 'GET' | 'POST', body?: unknown): Pr
       req.destroy(new Error(`Python API timeout after ${PYTHON_API_TIMEOUT_MS}ms`));
     });
 
-    req.on('error', (error) => {
-      reject(error);
-    });
+    req.on('error', reject);
 
     if (payload) {
       req.write(payload);
     }
-
     req.end();
   });
 }
 
-export async function POST(request: NextRequest) {
+export async function GET() {
   try {
-    const body = await request.json();
-    const { query, top_k = 5, conversation_id, conversation_history = [] } = body;
-
-    if (!query) {
-      return NextResponse.json(
-        { error: 'Query is required' },
-        { status: 400 }
-      );
-    }
-
-    // Call Python FastAPI backend
-    const response = await callPythonApi('/api/chat', 'POST', {
-      query,
-      top_k,
-      conversation_id,
-      conversation_history,
-    });
+    const response = await callPythonApi('/api/conversations', 'GET');
 
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`Python API returned ${response.status}`);
     }
 
     return NextResponse.json(response.data);
-
   } catch (error) {
-    console.error('Error calling Python API:', error);
-    
     return NextResponse.json(
       {
-        success: false,
-        error: error instanceof Error ? error.message : 'Failed to process query',
-        answer: 'Sorry, I encountered an error. Please make sure the Python backend is running.',
+        conversations: [],
+        error: error instanceof Error ? error.message : 'Failed to load conversations',
       },
       { status: 500 }
     );
   }
 }
 
-export async function GET() {
+export async function POST(request: NextRequest) {
   try {
-    // Health check - ping Python backend
-    const response = await callPythonApi('/health', 'GET');
+    const body = await request.json().catch(() => ({}));
+
+    const response = await callPythonApi('/api/conversations', 'POST', body ?? {});
 
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`Python API returned ${response.status}`);
     }
-    
-    return NextResponse.json({
-      status: 'ok',
-      backend: response.data,
-      message: 'Chat API is ready',
-    });
+
+    return NextResponse.json(response.data);
   } catch (error) {
-    return NextResponse.json({
-      status: 'error',
-      message: 'Python backend is not responding. Make sure it\'s running on port 8000.',
-    }, { status: 503 });
+    return NextResponse.json(
+      {
+        error: error instanceof Error ? error.message : 'Failed to create conversation',
+      },
+      { status: 500 }
+    );
   }
 }

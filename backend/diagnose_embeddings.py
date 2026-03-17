@@ -28,9 +28,9 @@ if response.data:
 
 # 2. Check the model
 print(f"\n🤖 Model Status:")
-model = SentenceTransformer('distiluse-base-multilingual-cased-v2')
+model = SentenceTransformer('BAAI/bge-m3')
 test_embedding = model.encode("Hello world")
-print(f"   Model: distiluse-base-multilingual-cased-v2")  
+print(f"   Model: BAAI/bge-m3")  
 print(f"   Produces dimension: {len(test_embedding)}")
 print(f"   Type: {type(test_embedding)}")
 

@@ -28,7 +28,7 @@ else:
 
 # 2. Check query embedding dimension
 print("\n=== CHECKING QUERY EMBEDDING ===")
-model = SentenceTransformer('distiluse-base-multilingual-cased-v2')
+model = SentenceTransformer('BAAI/bge-m3')
 q = model.encode('financial assistance').tolist()
 print(f"Query dimension  : {len(q)}")
 

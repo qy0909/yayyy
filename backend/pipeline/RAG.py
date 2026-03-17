@@ -13,11 +13,14 @@ import os
 import re
 from typing import List, Dict, Any, Optional
 import json
+import time
+import requests
 from datetime import datetime
+from urllib.parse import urlparse
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 # ============================================================================
 # 🔧 CONFIGURABLE: CORE LIBRARIES AND MODELS
@@ -75,9 +78,13 @@ except ImportError:
 # ============================================================================
 
 # Embedding Model - Used for converting text to vectors
-# Options: 'distiluse-base-multilingual-cased-v2', 'all-MiniLM-L6-v2', 
-#          'paraphrase-multilingual-mpnet-base-v2'
-EMBEDDING_MODEL_NAME = 'distiluse-base-multilingual-cased-v2'
+# Options: 'BAAI/bge-m3', 'distiluse-base-multilingual-cased-v2',
+#          'all-MiniLM-L6-v2', 'paraphrase-multilingual-mpnet-base-v2'
+EMBEDDING_MODEL_NAME = 'BAAI/bge-m3'
+
+# Embedding provider
+# Options: 'hf_inference' (cloud), 'local' (SentenceTransformer)
+EMBEDDING_PROVIDER = os.getenv('EMBEDDING_PROVIDER', 'hf_inference').lower()
 
 # SpaCy Language Models
 # Options: 'en_core_web_sm', 'en_core_web_md', 'en_core_web_lg' (English)
@@ -87,14 +94,14 @@ SPACY_MODEL_MULTILINGUAL = 'xx_ent_wiki_sm'
 
 # ============================================================================
 # 🔧 HACKATHON: LLM Provider Selection
-# Options: 'hf_inference', 'gemini', 'groq', 'huggingface', 'openai'
+# Options: 'hf_inference', 'openrouter', 'gemini', 'groq', 'huggingface', 'openai'
 # ============================================================================
-# 🌟 RECOMMENDED: 'hf_inference' - SEA-LION cloud (NO DOWNLOAD, best for ASEAN!)
-LLM_PROVIDER = 'hf_inference'  # Change based on your preference
+# 🌟 TEMPORARY: Use OpenRouter free model as primary provider
+LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'openrouter').lower()  # Change based on your preference
 
 # Enable automatic fallback if primary provider fails
 ENABLE_FALLBACK = True
-FALLBACK_ORDER = ['hf_inference', 'gemini', 'groq', 'huggingface']  # Try in this order
+FALLBACK_ORDER = ['hf_inference', 'openrouter', 'gemini', 'groq', 'huggingface']  # Try in this order
 
 # OpenAI LLM Model Selection
 # Options: 'gpt-3.5-turbo', 'gpt-4', 'gpt-4-turbo', 'gpt-4o'
@@ -133,10 +140,10 @@ USE_QUANTIZATION = True  # Set False if you have >16GB RAM
 # ============================================================================
 
 # Google Gemini Models
-# 'gemini-1.5-flash' - Fastest, best for demos (FREE)
-# 'gemini-1.5-pro' - Best quality, slower (FREE with limits)
-# 'gemini-2.0-flash-exp' - Experimental, very fast
-GEMINI_MODEL = 'gemini-1.5-flash'
+# 'gemini-2.0-flash-lite' - Best default for free-tier usage
+# 'gemini-2.0-flash-lite-001' - Version-pinned lite variant
+# 'gemini-2.0-flash' - Higher quality, typically tighter limits
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash-lite')
 
 # Groq Models (all FREE)
 # 'llama-3.3-70b-versatile' - Newest, best quality
@@ -147,6 +154,11 @@ GROQ_MODEL = 'llama-3.3-70b-versatile'
 # Hugging Face Inference API Models
 # Can use any public model on HF Hub
 HF_INFERENCE_MODEL = 'aisingapore/llama3-8b-cpt-sea-lionv2.1-instruct'
+
+# OpenRouter Models
+# Free model from your request
+OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'mistralai/mistral-small-3.1-24b-instruct:free')
+OPENROUTER_FALLBACK_MODEL = os.getenv('OPENROUTER_FALLBACK_MODEL', 'mistralai/mistral-small-3.1-24b-instruct:free')
 
 # ============================================================================
 # 🔧 CONFIGURABLE: API KEYS AND DATABASE CONNECTION
@@ -162,12 +174,25 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'YOUR_GEMINI_API_KEY')  # Get at: h
 GROQ_API_KEY = os.getenv('GROQ_API_KEY', 'YOUR_GROQ_API_KEY')  # Get at: https://console.groq.com
 HF_TOKEN = os.getenv('HF_TOKEN', 'YOUR_HF_TOKEN')  # Get at: https://huggingface.co/settings/tokens
 
+# OpenRouter configuration
+DEFAULT_OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1/chat/completions'
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', 'YOUR_OPENROUTER_API_KEY')
+OPENROUTER_BASE_URL = os.getenv('OPENROUTER_BASE_URL', DEFAULT_OPENROUTER_BASE_URL)
+OPENROUTER_SITE_URL = os.getenv('OPENROUTER_SITE_URL', '')
+OPENROUTER_SITE_NAME = os.getenv('OPENROUTER_SITE_NAME', '')
+
+# Hugging Face API resilience settings
+HF_EMBEDDING_MAX_RETRIES = int(os.getenv('HF_EMBEDDING_MAX_RETRIES', '3'))
+HF_LLM_MAX_RETRIES = int(os.getenv('HF_LLM_MAX_RETRIES', '2'))
+HF_RETRY_DELAY_SECONDS = float(os.getenv('HF_RETRY_DELAY_SECONDS', '1.5'))
+HF_EMBEDDING_WARMUP = os.getenv('HF_EMBEDDING_WARMUP', 'false').lower() in {'1', 'true', 'yes'}
+
 # ============================================================================
 # 🔧 CONFIGURABLE: VECTOR SEARCH PARAMETERS
 # ============================================================================
 
 # Number of similar documents to retrieve
-TOP_K_RESULTS = 1
+TOP_K_RESULTS = int(os.getenv('TOP_K_RESULTS', '3'))
 
 # Supabase table name for embeddings
 EMBEDDINGS_TABLE_NAME = 'embeddings'
@@ -181,6 +206,10 @@ SIMILARITY_THRESHOLD = 0.15
 
 # Number of bullet points in summary
 NUM_BULLET_POINTS = '3-5'
+
+# Response style for generated answers
+# Options: 'narrative', 'bullet', 'mixed'
+ANSWER_STYLE = os.getenv('ANSWER_STYLE', 'narrative').lower()
 
 # Reading level for simplification
 READING_LEVEL = '5th-grade'
@@ -287,17 +316,53 @@ class RAGPipeline:
         # Debug logging for frontend
         self.debug_logs = []
         
-        # Step 0: Initialize embedding model
-        print(f"📦 Loading embedding model: {EMBEDDING_MODEL_NAME}")
-        self.embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
-        print(f"   ✓ Embedding dimension: {embedding_dim}")
+        # Step 0: Initialize embedding provider
+        self.embedding_provider = EMBEDDING_PROVIDER
+        self.embedding_model = None
+        self.embedding_client = None
+        self.embedding_dim = None
+
+        print(f"📦 Initializing embeddings ({self.embedding_provider}): {EMBEDDING_MODEL_NAME}")
+        if self.embedding_provider == 'hf_inference':
+            if not HF_INFERENCE_AVAILABLE:
+                print("⚠️  HF embedding provider selected but huggingface_hub is not installed")
+                print("   Falling back to local SentenceTransformer embeddings")
+                self.embedding_provider = 'local'
+            elif not HF_TOKEN or HF_TOKEN == 'YOUR_HF_TOKEN':
+                print("⚠️  HF embedding provider selected but HF_TOKEN is not configured")
+                print("   Falling back to local SentenceTransformer embeddings")
+                self.embedding_provider = 'local'
+            else:
+                try:
+                    self.embedding_client = InferenceClient(
+                        model=EMBEDDING_MODEL_NAME,
+                        token=HF_TOKEN,
+                    )
+                    if HF_EMBEDDING_WARMUP:
+                        warmup_vec = self._get_hf_embedding_with_retry("Embedding warmup test")
+                        self.embedding_dim = len(warmup_vec)
+                        print(f"   ✓ HF embeddings initialized (dimension: {self.embedding_dim})")
+                    else:
+                        print("   ✓ HF embeddings client initialized (warmup disabled)")
+                except Exception as e:
+                    print(f"   ⚠️  HF embedding initialization failed: {e}")
+                    print("   ℹ️  Falling back to local SentenceTransformer embeddings")
+                    self.embedding_provider = 'local'
+
+        if self.embedding_provider == 'local':
+            print(f"📦 Loading local embedding model: {EMBEDDING_MODEL_NAME}")
+            self.embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+            self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
+            print(f"   ✓ Local embedding dimension: {self.embedding_dim}")
         
         # Initialize SpaCy models
         print(f"📦 Loading SpaCy models...")
         try:
             self.nlp_en = spacy.load(SPACY_MODEL_EN)
             self.nlp_multi = spacy.load(SPACY_MODEL_MULTILINGUAL)
+            # xx_ent_wiki_sm has no parser/sentencizer by default — add one so doc.sents works
+            if not self.nlp_multi.has_pipe("sentencizer"):
+                self.nlp_multi.add_pipe("sentencizer")
         except OSError as e:
             print(f"⚠️  SpaCy model not found: {e}")
             print("Run: python -m spacy download en_core_web_sm")
@@ -331,10 +396,48 @@ class RAGPipeline:
         
         # Initialize LLM based on provider
         self.llm_provider = LLM_PROVIDER
+        self.active_llm_provider = None
         self._init_llm_provider(LLM_PROVIDER)
     
+    def _get_llm_model_name(self, provider: str) -> str:
+        """Return the configured model name for a provider."""
+        model_map = {
+            'gemini': GEMINI_MODEL,
+            'groq': GROQ_MODEL,
+            'hf_inference': HF_INFERENCE_MODEL,
+            'openrouter': OPENROUTER_MODEL,
+            'openai': OPENAI_MODEL_NAME,
+            'huggingface': HUGGINGFACE_MODEL_NAME,
+        }
+        return model_map.get(provider, 'unknown-model')
+
+    def _describe_active_llm(self, provider: Optional[str] = None) -> str:
+        """Build a readable label for the currently selected LLM."""
+        resolved_provider = provider or self.active_llm_provider or self.llm_provider
+        model_name = self._get_llm_model_name(resolved_provider)
+        return f"provider={resolved_provider}, model={model_name}"
+
+    def _get_openrouter_base_url(self) -> str:
+        """Return a safe OpenRouter endpoint and fall back if misconfigured."""
+        candidate = (OPENROUTER_BASE_URL or '').strip()
+        if not candidate:
+            return DEFAULT_OPENROUTER_BASE_URL
+
+        parsed = urlparse(candidate)
+        if parsed.scheme != 'https' or parsed.netloc.lower() != 'openrouter.ai':
+            warning = (
+                f"[Step 5] ⚠️ Invalid OPENROUTER_BASE_URL '{candidate}'. "
+                f"Falling back to {DEFAULT_OPENROUTER_BASE_URL}"
+            )
+            self._log_debug(warning)
+            print(warning)
+            return DEFAULT_OPENROUTER_BASE_URL
+
+        return candidate
+
     def _init_llm_provider(self, provider: str):
         """Initialize the specified LLM provider"""
+        self.active_llm_provider = provider
         
         if provider == 'gemini' and GEMINI_AVAILABLE:
             print(f"🌟 Initializing Google Gemini: {GEMINI_MODEL}")
@@ -351,6 +454,12 @@ class RAGPipeline:
             print(f"🤗 Initializing Hugging Face Inference API: {HF_INFERENCE_MODEL}")
             self.hf_inference_client = InferenceClient(token=HF_TOKEN)
             print(f"   ✓ HF Inference initialized (SEA-LION cloud access!)")
+
+        elif provider == 'openrouter':
+            if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == 'YOUR_OPENROUTER_API_KEY':
+                raise ValueError("OPENROUTER_API_KEY not configured. Set OPENROUTER_API_KEY in your .env file")
+            print(f"🛣️  Initializing OpenRouter: {OPENROUTER_MODEL}")
+            print("   ✓ OpenRouter initialized")
             
         elif provider == 'openai':
             print(f"🤖 Initializing OpenAI client with model: {OPENAI_MODEL_NAME}")
@@ -384,6 +493,8 @@ class RAGPipeline:
             
         else:
             available = []
+            if OPENROUTER_API_KEY and OPENROUTER_API_KEY != 'YOUR_OPENROUTER_API_KEY':
+                available.append('openrouter')
             if GEMINI_AVAILABLE: available.append('gemini')
             if GROQ_AVAILABLE: available.append('groq')
             if HF_INFERENCE_AVAILABLE: available.append('hf_inference')
@@ -399,6 +510,7 @@ class RAGPipeline:
         # Initialize Supabase client
         print(f"🗄️  Connecting to Supabase...")
         self.supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print(f"🧠 Active LLM configured: {self._describe_active_llm(provider)}")
         
         print("✅ RAG Pipeline initialized successfully!\n")
     
@@ -627,6 +739,74 @@ class RAGPipeline:
     # ========================================================================
     # STEP 2: QUERY EMBEDDING
     # ========================================================================
+
+    def _coerce_embedding_vector(self, raw_embedding: Any) -> List[float]:
+        """Normalize embedding outputs from HF/local providers into a flat float list."""
+        if hasattr(raw_embedding, 'tolist'):
+            raw_embedding = raw_embedding.tolist()
+
+        if isinstance(raw_embedding, dict):
+            for key in ('embedding', 'embeddings', 'vector'):
+                if key in raw_embedding:
+                    return self._coerce_embedding_vector(raw_embedding[key])
+
+        if isinstance(raw_embedding, list):
+            if raw_embedding and isinstance(raw_embedding[0], list):
+                raw_embedding = raw_embedding[0]
+            return [float(x) for x in raw_embedding]
+
+        raise ValueError("Unexpected embedding response format")
+
+    def _is_transient_hf_error(self, error: Exception) -> bool:
+        """Return True for retryable network or temporary Hugging Face errors."""
+        text = str(error).lower()
+        transient_markers = (
+            'readtimeout',
+            'timed out',
+            'timeout',
+            'connection aborted',
+            'connection reset',
+            'temporarily unavailable',
+            'service unavailable',
+            'bad gateway',
+            'gateway timeout',
+            '429',
+            '502',
+            '503',
+            '504',
+        )
+        return any(marker in text for marker in transient_markers)
+
+    def _get_hf_embedding_with_retry(self, text: str) -> List[float]:
+        """Get embedding from HF Inference API with retry/backoff for transient failures."""
+        if not self.embedding_client:
+            raise RuntimeError("HF embedding client not initialized")
+
+        last_error = None
+        for attempt in range(1, HF_EMBEDDING_MAX_RETRIES + 1):
+            try:
+                raw_embedding = self.embedding_client.feature_extraction(text)
+                return self._coerce_embedding_vector(raw_embedding)
+            except Exception as error:
+                last_error = error
+                is_retryable = self._is_transient_hf_error(error)
+                if not is_retryable or attempt == HF_EMBEDDING_MAX_RETRIES:
+                    break
+
+                wait_seconds = HF_RETRY_DELAY_SECONDS * attempt
+                msg = (
+                    f"[Step 2] ⚠️ HF embedding request failed (attempt {attempt}/"
+                    f"{HF_EMBEDDING_MAX_RETRIES}): {type(error).__name__}. "
+                    f"Retrying in {wait_seconds:.1f}s"
+                )
+                self._log_debug(msg)
+                print(f"   {msg}")
+                time.sleep(wait_seconds)
+
+        raise RuntimeError(
+            "Embedding service is temporarily unavailable. "
+            "Please retry in a few seconds."
+        ) from last_error
     
     def create_query_embedding(self, query: str) -> List[float]:
         """
@@ -639,12 +819,18 @@ class RAGPipeline:
             List of floats representing the embedding vector
         """
         print(f"🔢 Step 2: Creating query embedding...")
-        
-        # Generate embedding using the configured model
-        embedding = self.embedding_model.encode(query)
-        
+
+        if self.embedding_provider == 'hf_inference' and self.embedding_client:
+            embedding = self._get_hf_embedding_with_retry(query)
+        else:
+            embedding = self.embedding_model.encode(query).tolist()
+
+        if self.embedding_dim is None:
+            self.embedding_dim = len(embedding)
+            print(f"   ℹ️  Detected embedding dimension: {self.embedding_dim}")
+
         print(f"   ✓ Generated embedding of dimension: {len(embedding)}")
-        return embedding.tolist()
+        return embedding
     
     # ========================================================================
     # STEP 3: VECTOR SEARCH IN SUPABASE
@@ -699,11 +885,141 @@ class RAGPipeline:
     # STEP 4: LLM PROMPT PREPARATION
     # ========================================================================
     
+    def _is_process_question(self, user_query: str) -> bool:
+        """Detect whether a query is procedural and should keep step-by-step guidance."""
+        process_keywords = {
+            'how', 'steps', 'apply', 'process', 'cara', 'bagaimana', 'langkah',
+            'proses', 'mohon', 'daftar', 'permohonan'
+        }
+        lowered_query = (user_query or '').lower()
+        return any(keyword in lowered_query for keyword in process_keywords)
+
+    def classify_query_intent(self, query: str) -> str:
+        """
+        Classify whether the query needs RAG retrieval or is a general/conversational message.
+
+        Returns:
+            'general'        -- greetings, thanks, chit-chat: skip vector search
+            'task_or_policy' -- procedure / eligibility / document questions: full RAG
+        """
+        stripped = (query or '').strip()
+        word_count = len(stripped.split())
+        lowered = stripped.lower()
+
+        # Fast-path: known greeting / filler patterns
+        GENERAL_PATTERNS = [
+            r'^(hi|hello|hey|helo|hai|howdy|yo)\b',
+            r'^(thank(s| you)|terima kasih|thanks?)\b',
+            r'^(ok|okay|alright|got it|understood|i see|i understand)\b',
+            r'^(bye|goodbye|selamat tinggal|sampai jumpa)\b',
+            r'^(good morning|good afternoon|good evening|selamat pagi|selamat tengahari|selamat petang)\b',
+            r'^(yes|no|yep|nope|yeah|ya|tidak)\s*$',
+            r'^(who are you|what are you|what can you do|are you a bot|are you human)\b',
+            r'^(test|testing)\s*$',
+        ]
+        for pattern in GENERAL_PATTERNS:
+            if re.search(pattern, lowered):
+                return 'general'
+
+        # Task / policy indicator keywords — any match forces full RAG
+        TASK_INDICATORS = {
+            'how', 'what', 'when', 'where', 'who', 'which', 'why',
+            'apply', 'register', 'submit', 'pay', 'claim', 'check',
+            'eligible', 'eligibility', 'document', 'requirement', 'deadline',
+            'form', 'fee', 'cost', 'amount', 'income', 'salary', 'age',
+            'cara', 'bagaimana', 'apa', 'bila', 'di', 'mana', 'siapa',
+            'mohon', 'daftar', 'bayar', 'semak', 'layak', 'dokumen', 'borang',
+            'process', 'procedure', 'step', 'langkah', 'proses',
+            'benefit', 'allowance', 'assistance', 'support', 'scheme', 'grant', 'aid',
+            'bantuan', 'elaun', 'skim', 'faedah', 'subsidi',
+            'policy', 'rule', 'regulation', 'law', 'act',
+            'dasar', 'peraturan', 'undang', 'syarat',
+            'hospital', 'clinic', 'school', 'university', 'college',
+            'tax', 'cukai', 'permit', 'license', 'lesen',
+        }
+        query_tokens = set(re.findall(r'\b\w+\b', lowered))
+        if query_tokens & TASK_INDICATORS:
+            return 'task_or_policy'
+
+        # Short message with no task indicator → treat as general
+        if word_count <= 6:
+            return 'general'
+
+        return 'task_or_policy'
+
+    def _detect_step_confirmation(self, user_query: str, conversation_history: Optional[List[Dict[str, str]]]) -> bool:
+        """
+        Return True when the user is confirming a previous step-gate offer.
+        Checks if the last assistant message offered detailed steps AND the current
+        user message is an affirmative.
+        """
+        if not conversation_history:
+            return False
+
+        GATE_MARKER = '[STEP_GATE]'
+        # Last assistant turn
+        last_assistant = None
+        for turn in reversed(conversation_history):
+            if (turn.get('role') or '').lower() == 'assistant':
+                last_assistant = turn.get('text', '')
+                break
+
+        if not last_assistant or GATE_MARKER not in last_assistant:
+            return False
+
+        CONFIRM_PATTERNS = [
+            r'\b(yes|yeah|yep|ya|sure|ok|okay|please|continue|go on|proceed|tell me|show me|i want|yes please|go ahead)\b',
+            r'\b(bolton|boleh|teruskan|lanjutkan|mahu|nak|sila|cerita|bagitahu)\b',
+        ]
+        lowered = (user_query or '').lower()
+        return any(re.search(p, lowered) for p in CONFIRM_PATTERNS)
+
+    def _prepare_general_prompt(
+        self,
+        user_query: str,
+        target_language: str,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        conversation_summary: str = "",
+    ) -> str:
+        """Build a lightweight conversational prompt when no RAG retrieval is needed."""
+        history_lines = []
+        for turn in (conversation_history or [])[-4:]:
+            role = (turn.get('role') or 'user').strip().lower()
+            text = re.sub(r'\s+', ' ', (turn.get('text') or '')).strip()
+            if role not in {'user', 'assistant'} or not text:
+                continue
+            speaker = 'User' if role == 'user' else 'Assistant'
+            history_lines.append(f"- {speaker}: {text[:200]}")
+        conversation_context = '\n'.join(history_lines) if history_lines else 'No prior conversation.'
+        summary_text = (conversation_summary or '').strip() or 'No earlier summary.'
+
+        return f"""You are CivicGuide, a warm and helpful public-service assistant.
+
+User message (in {target_language}): \"{user_query}\"
+
+Earlier Conversation Summary:
+{summary_text}
+
+Recent Conversation:
+{conversation_context}
+
+Instructions:
+1. Respond in natural, friendly language in {target_language}.
+2. For greetings or thanks, reply warmly in 1-2 sentences.
+3. If the user seems to have a real question or need, gently ask one clarifying question to understand what they need help with (e.g., housing, education, financial aid, registration).
+4. Do not invent government policies or procedures.
+5. Keep your reply short (2-4 sentences maximum).
+6. Do not start with stock phrases like \"Here's a helpful response\" or \"Certainly!\".
+"""
+
     def prepare_llm_prompt(
         self, 
         user_query: str, 
         retrieved_chunks: List[Dict[str, Any]], 
-        target_language: str
+        target_language: str,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        conversation_summary: str = "",
+        use_step_gate: bool = False,
     ) -> str:
         """
         Prepare the prompt for the LLM with retrieved context
@@ -712,6 +1028,8 @@ class RAGPipeline:
             user_query: Original user query
             retrieved_chunks: Relevant document chunks from vector search
             target_language: Language to translate the answer to
+            conversation_history: Recent conversation turns for follow-up context
+            conversation_summary: Rolling summary of older conversation context
             
         Returns:
             Formatted prompt string
@@ -720,7 +1038,7 @@ class RAGPipeline:
 
         compressed_chunks = self._compress_retrieved_chunks(user_query, retrieved_chunks)
         
-        # Format retrieved documents
+        # Format retrieved documents with citation tags
         context_docs = []
         for idx, chunk in enumerate(compressed_chunks, 1):
             # Adjust field names based on your Supabase schema
@@ -730,34 +1048,98 @@ class RAGPipeline:
             lang = chunk.get('language', 'unknown')
             
             context_docs.append(
-                f"{idx}. [{title}] ({lang})\n"
+                f"{idx}. [S{idx}] [{title}] ({lang})\n"
                 f"   Content: {text}\n"
                 f"   Source: {source}\n"
             )
         
         context_text = "\n".join(context_docs)
+        history_lines = []
+        for turn in (conversation_history or [])[-6:]:
+            role = (turn.get('role') or 'user').strip().lower()
+            text = re.sub(r'\s+', ' ', (turn.get('text') or '')).strip()
+            if role not in {'user', 'assistant'} or not text:
+                continue
+            speaker = 'User' if role == 'user' else 'Assistant'
+            history_lines.append(f"- {speaker}: {text[:300]}")
+
+        conversation_context = "\n".join(history_lines) if history_lines else "No prior conversation."
+        summary_text = (conversation_summary or "").strip() or "No earlier summary."
         
-        # ====================================================================
-        # 🔧 CONFIGURABLE: LLM PROMPT TEMPLATE
-        # Customize this prompt based on your specific requirements
-        # ====================================================================
-        
-        prompt = f"""You are a helpful multilingual assistant for migrant workers and immigrants.
+        # Decide if the user is asking a process/how-to question.
+        is_process_question = self._is_process_question(user_query)
+
+        if ANSWER_STYLE == 'bullet':
+            response_format = (
+                f"Write {NUM_BULLET_POINTS} concise bullet points only. "
+                "Each point must be practical and easy to follow."
+            )
+        elif use_step_gate:
+            # Step-gating: give a concise overview first, then offer detailed steps
+            response_format = (
+                "Give a brief overview in 2-3 sentences answering the core question. "
+                "Then end with exactly this sentence: "
+                "\"Would you like me to walk you through the detailed step-by-step process? [STEP_GATE]\""
+            )
+        elif is_process_question:
+            response_format = (
+                "Use a short introduction in plain language, then provide 3-5 numbered steps in order. "
+                "End with one gentle follow-up question that helps the user continue."
+            )
+        else:
+            response_format = (
+                "Default to natural paragraph style, not bullet-heavy formatting. "
+                "Use this structure: (1) direct answer in 1-2 sentences, "
+                "(2) what the user should do next, "
+                "(3) what to prepare if relevant, "
+                "(4) one short follow-up question."
+            )
+
+        list_format_guardrail = ""
+        if ANSWER_STYLE == 'narrative' and not is_process_question:
+            list_format_guardrail = (
+                "Do NOT use bullet points, numbered lists, markdown list markers, or list-style formatting. "
+                "Write in short, plain paragraphs suitable for low-literacy users."
+            )
+
+        prompt = f"""You are CivicGuide, an inclusive public-service assistant.
+
+Mission:
+- Help every citizen understand and access government support.
+- Reduce information barriers for users with low literacy or limited digital skills.
 
 User Query (in {target_language}): "{user_query}"
 
-Retrieved Documents:
+Earlier Conversation Summary:
+{summary_text}
+
+Recent Conversation:
+{conversation_context}
+
+Retrieved Official Context:
 {context_text}
 
 Instructions:
-1. Summarize the information into {NUM_BULLET_POINTS} clear bullet points
-2. Simplify complex legal, medical, or technical jargon to {READING_LEVEL} reading level
-3. Translate your entire answer to {target_language}
-4. Include source URLs for each main point (use the format: [Source: URL])
-5. If the documents don't contain relevant information, politely say so
-6. Be accurate and helpful
+1. Use retrieved context as evidence. Do not copy large chunks verbatim.
+2. Use plain language at approximately {READING_LEVEL} reading level. Keep sentences short and clear.
+3. Be respectful, calm, and practical. Avoid legalistic or bureaucratic tone.
+4. If context is incomplete or uncertain, say so clearly and provide the safest next step.
+5. Do not invent eligibility rules, deadlines, required documents, or links.
+6. Respond in natural language in {target_language}.
+7. Do not include raw source URLs in the answer body because sources are shown separately in the UI.
+8. {response_format}
+9. {list_format_guardrail}
+10. Start with the answer directly. Avoid stock lead-ins such as "Here's a helpful response", "Here's a simplified explanation", "Here's a guide", or similar filler.
+11. Avoid sounding like a template. Do not add decorative titles or headings unless they are needed to explain steps clearly.
+12. If the user is asking a follow-up question, use the recent conversation to resolve references like "it", "that", or "the deadline" before answering.
+13. When you use information from a source, add an inline citation tag like [S1] or [S2] immediately after the relevant sentence. Use the source numbers provided in the Retrieved Official Context above.
 
-Format your response as bullet points with sources.
+Before finalizing, check:
+- Can a 12-year-old understand this answer?
+- Does this answer include a clear next action?
+- Is the answer concise without unnecessary list formatting?
+
+Do not simply repeat document snippets. Synthesize them into one helpful answer.
 """
         
         print(f"   ✓ Prompt prepared ({len(prompt)} characters)")
@@ -817,8 +1199,12 @@ Format your response as bullet points with sources.
         }
 
         nlp = self.nlp_en if all(ord(ch) < 128 for ch in cleaned_text[:200]) else self.nlp_multi
-        doc = nlp(cleaned_text)
-        sentences = [sentence.text.strip() for sentence in doc.sents if sentence.text.strip()]
+        try:
+            doc = nlp(cleaned_text)
+            sentences = [sentence.text.strip() for sentence in doc.sents if sentence.text.strip()]
+        except Exception:
+            # Model lacks a sentencizer/parser — fall back to regex sentence splitting.
+            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', cleaned_text) if s.strip()]
 
         if not sentences:
             return cleaned_text[:CHUNK_SUMMARY_MAX_CHARS].rsplit(' ', 1)[0].strip() + '...'
@@ -873,6 +1259,10 @@ Format your response as bullet points with sources.
         Returns:
             LLM-generated response text
         """
+        active_llm_label = self._describe_active_llm()
+        self._log_debug(f"[Step 5] 🧠 Active LLM for this request: {active_llm_label}")
+        print(f"🧠 Active LLM for this request: {active_llm_label}")
+
         # Try primary provider
         try:
             return self._call_llm_provider(self.llm_provider, prompt)
@@ -892,6 +1282,9 @@ Format your response as bullet points with sources.
                         self._log_debug(f"[Step 5] {fallback_msg}")
                         print(f"   {fallback_msg}")
                         self._init_llm_provider(fallback_provider)
+                        fallback_label = self._describe_active_llm(fallback_provider)
+                        self._log_debug(f"[Step 5] 🧠 Switched active LLM: {fallback_label}")
+                        print(f"🧠 Switched active LLM: {fallback_label}")
                         return self._call_llm_provider(fallback_provider, prompt)
                     except Exception as fallback_error:
                         fallback_error_msg = f"⚠️  Fallback '{fallback_provider}' also failed: {str(fallback_error)}"
@@ -908,6 +1301,8 @@ Format your response as bullet points with sources.
         """Route to specific provider's LLM call"""
         if provider == 'gemini':
             return self._call_gemini_llm(prompt)
+        elif provider == 'openrouter':
+            return self._call_openrouter_llm(prompt)
         elif provider == 'groq':
             return self._call_groq_llm(prompt)
         elif provider == 'hf_inference':
@@ -1004,6 +1399,91 @@ Format your response as bullet points with sources.
                 self._log_debug(f"[Step 5] 💡 Fix: Check your GROQ_API_KEY in .env file")
             
             raise
+
+    def _call_openrouter_llm(self, prompt: str) -> str:
+        """Call OpenRouter chat completions API using a free model."""
+        print(f"🛣️  Step 5: Calling OpenRouter ({OPENROUTER_MODEL})...")
+        self._log_debug(f"[Step 5] 🛣️  Using OpenRouter: {OPENROUTER_MODEL}")
+
+        try:
+            if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == 'YOUR_OPENROUTER_API_KEY':
+                error = "OPENROUTER_API_KEY not configured. Set OPENROUTER_API_KEY in your .env file"
+                self._log_debug(f"[Step 5] ❌ {error}")
+                raise ValueError(error)
+
+            headers = {
+                'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+                'Content-Type': 'application/json',
+            }
+            if OPENROUTER_SITE_URL:
+                headers['HTTP-Referer'] = OPENROUTER_SITE_URL
+            if OPENROUTER_SITE_NAME:
+                headers['X-OpenRouter-Title'] = OPENROUTER_SITE_NAME
+
+            openrouter_url = self._get_openrouter_base_url()
+
+            def _post_openrouter(model_name: str) -> requests.Response:
+                payload = {
+                    'model': model_name,
+                    'messages': [
+                        {
+                            'role': 'user',
+                            'content': prompt,
+                        }
+                    ],
+                    'max_tokens': MAX_TOKENS,
+                    'temperature': LLM_TEMPERATURE,
+                }
+                self._log_debug(f'[Step 5] 📡 Sending request to OpenRouter API: {openrouter_url} (model={model_name})')
+                print(f'   📡 OpenRouter endpoint: {openrouter_url} (model={model_name})')
+                return requests.post(
+                    openrouter_url,
+                    headers=headers,
+                    data=json.dumps(payload),
+                    timeout=120,
+                )
+
+            response = _post_openrouter(OPENROUTER_MODEL)
+
+            if response.status_code == 404 and OPENROUTER_FALLBACK_MODEL and OPENROUTER_FALLBACK_MODEL != OPENROUTER_MODEL:
+                preview = (response.text or '').strip().replace('\n', ' ')[:280]
+                self._log_debug(
+                    f"[Step 5] ⚠️ OpenRouter model '{OPENROUTER_MODEL}' returned 404. "
+                    f"Retrying with fallback model '{OPENROUTER_FALLBACK_MODEL}'. Details: {preview}"
+                )
+                print(f"   ⚠️  Model '{OPENROUTER_MODEL}' returned 404. Retrying with '{OPENROUTER_FALLBACK_MODEL}'...")
+                response = _post_openrouter(OPENROUTER_FALLBACK_MODEL)
+
+            response.raise_for_status()
+
+            data = response.json()
+            answer = data['choices'][0]['message']['content']
+            self._log_debug(f"[Step 5] ✓ OpenRouter response: {len(answer)} chars")
+            print(f"   ✓ OpenRouter response generated ({len(answer)} characters)")
+            return answer
+
+        except requests.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else 'unknown'
+            body_preview = ''
+            if e.response is not None and e.response.text:
+                body_preview = e.response.text.strip().replace('\n', ' ')[:500]
+            error_details = (
+                f"OpenRouter API failed at {self._get_openrouter_base_url()}: "
+                f"HTTP {status_code}: {str(e)}"
+            )
+            self._log_debug(f"[Step 5] ❌ {error_details}")
+            if body_preview:
+                self._log_debug(f"[Step 5] ❌ OpenRouter response body: {body_preview}")
+            print(f"   ⚠️  {error_details}")
+            if body_preview:
+                print(f"   ⚠️  OpenRouter body: {body_preview}")
+            raise
+
+        except Exception as e:
+            error_details = f"OpenRouter API failed at {self._get_openrouter_base_url()}: {type(e).__name__}: {str(e)}"
+            self._log_debug(f"[Step 5] ❌ {error_details}")
+            print(f"   ⚠️  {error_details}")
+            raise
     
     def _call_hf_inference_llm(self, prompt: str) -> str:
         """Call Hugging Face Inference API (Cloud SEA models)"""
@@ -1025,12 +1505,32 @@ Format your response as bullet points with sources.
             
             self._log_debug(f"[Step 5] 📡 Sending request to HF Inference API...")
             
-            response = self.hf_inference_client.chat_completion(
-                messages=messages,
-                model=HF_INFERENCE_MODEL,
-                max_tokens=MAX_TOKENS,
-                temperature=LLM_TEMPERATURE,
-            )
+            response = None
+            last_error = None
+            for attempt in range(1, HF_LLM_MAX_RETRIES + 1):
+                try:
+                    response = self.hf_inference_client.chat_completion(
+                        messages=messages,
+                        model=HF_INFERENCE_MODEL,
+                        max_tokens=MAX_TOKENS,
+                        temperature=LLM_TEMPERATURE,
+                    )
+                    break
+                except Exception as error:
+                    last_error = error
+                    is_retryable = self._is_transient_hf_error(error)
+                    if not is_retryable or attempt == HF_LLM_MAX_RETRIES:
+                        raise
+
+                    wait_seconds = HF_RETRY_DELAY_SECONDS * attempt
+                    self._log_debug(
+                        f"[Step 5] ⚠️ HF LLM request failed (attempt {attempt}/{HF_LLM_MAX_RETRIES}): "
+                        f"{type(error).__name__}. Retrying in {wait_seconds:.1f}s"
+                    )
+                    time.sleep(wait_seconds)
+
+            if response is None and last_error:
+                raise last_error
             
             answer = response.choices[0].message.content
             self._log_debug(f"[Step 5] ✓ HF Inference response: {len(answer)} chars")
@@ -1125,44 +1625,149 @@ You are a helpful assistant specializing in providing simplified information to 
     # STEP 6: POST-PROCESSING
     # ========================================================================
     
-    def post_process_response(self, llm_response: str, language: str) -> Dict[str, Any]:
+    def post_process_response(
+        self,
+        llm_response: str,
+        language: str,
+        user_query: str = "",
+        allow_step_format: bool = False,
+    ) -> Dict[str, Any]:
         """
         Format the LLM response for frontend display
         
         Args:
             llm_response: Raw response from LLM
             language: Detected/target language
+            user_query: Original user query for safety-tailored response guards
+            allow_step_format: Preserve numbered step layout for process questions
             
         Returns:
             Formatted response dictionary
         """
         print(f"✨ Step 6: Post-processing response...")
+
+        def normalize_narrative_text(text: str) -> str:
+            """Convert list-like output into paragraph-style narrative text."""
+            lines = text.strip().split('\n')
+            normalized_lines = []
+
+            for raw_line in lines:
+                line = raw_line.strip()
+                if not line:
+                    normalized_lines.append('')
+                    continue
+
+                # Strip bullet and numbered list prefixes.
+                line = re.sub(r"^[-*•]+\s*", "", line)
+                line = re.sub(r"^\d+[\.)]\s*", "", line)
+                line = re.sub(r"^[a-zA-Z][\.)]\s*", "", line)
+                normalized_lines.append(line)
+
+            # Rebuild paragraphs while preserving intentional blank lines.
+            paragraphs = []
+            current = []
+            for line in normalized_lines:
+                if line == '':
+                    if current:
+                        paragraphs.append(' '.join(current).strip())
+                        current = []
+                    continue
+                current.append(line)
+
+            if current:
+                paragraphs.append(' '.join(current).strip())
+
+            return '\n\n'.join(p for p in paragraphs if p)
         
-        # Split response into bullet points
-        lines = llm_response.strip().split('\n')
-        bullet_points = []
+        cleaned_response = llm_response.strip()
+        cleaned_response = re.sub(
+            r"^(?:here(?:'|’)s|this is)\s+(?:a\s+)?(?:helpful|simple|simplified|clear|concise|quick)?\s*(?:response|explanation|guide|answer|summary)\s*:\s*",
+            "",
+            cleaned_response,
+            flags=re.IGNORECASE,
+        )
+        cleaned_response = re.sub(
+            r"^(?:here(?:'|’)s\s+how\s+to\s+|getting\s+[^\n:]{0,80}:\s*)",
+            "",
+            cleaned_response,
+            flags=re.IGNORECASE,
+        )
+        paragraphs = [segment.strip() for segment in re.split(r'\n\s*\n', cleaned_response) if segment.strip()]
+
+        if ANSWER_STYLE == 'bullet':
+            answer_items = []
+            for line in cleaned_response.split('\n'):
+                line = line.strip()
+                if line and (line.startswith('•') or line.startswith('-') or line.startswith('*') or line[0].isdigit()):
+                    normalized = line.lstrip('•-*0123456789. ').strip()
+                    if normalized:
+                        answer_items.append(f"• {normalized}")
+            if not answer_items:
+                answer_items = [cleaned_response]
+            answer_text = '\n'.join(answer_items)
+        else:
+            if allow_step_format:
+                # Keep numbered instructions for procedural questions, but remove bullet markers.
+                step_lines = []
+                for raw_line in cleaned_response.split('\n'):
+                    line = raw_line.strip()
+                    if not line:
+                        step_lines.append('')
+                        continue
+                    line = re.sub(r"^[-*•]+\s*", "", line)
+                    step_lines.append(line)
+                narrative_text = '\n'.join(step_lines).strip()
+            else:
+                narrative_text = normalize_narrative_text(cleaned_response)
+
+            if not narrative_text:
+                if not paragraphs:
+                    paragraphs = [cleaned_response]
+                narrative_text = '\n\n'.join(paragraphs)
+            answer_text = narrative_text
+            answer_items = [answer_text]
         
-        for line in lines:
-            line = line.strip()
-            if line and (line.startswith('•') or line.startswith('-') or 
-                        line.startswith('*') or line[0].isdigit()):
-                # Clean up bullet point
-                cleaned = line.lstrip('•-*0123456789. ')
-                if cleaned:
-                    bullet_points.append(f"• {cleaned}")
-        
-        # If no bullet points found, treat entire response as one point
-        if not bullet_points:
-            bullet_points = [f"• {llm_response}"]
-        
+        query_lower = (user_query or "").lower()
+
+        # Ensure users who are missing documents always get a safe alternative path.
+        if any(keyword in query_lower for keyword in ["salary slip", "missing", "don't have", "do not have", "without"]):
+            has_alternative_hint = any(
+                phrase in answer_text.lower()
+                for phrase in ["alternative", "instead", "can still apply", "other document", "supporting document"]
+            )
+            if not has_alternative_hint:
+                answer_text = (
+                    f"{answer_text}\n\n"
+                    "If you do not have one document, ask the agency whether they can accept an alternative document such as a letter, bank statement, or other supporting document instead."
+                )
+
+        # Ensure users with low digital confidence get an offline option.
+        if any(keyword in query_lower for keyword in ["online form", "don't know how", "do not know how", "not good with", "digital"]):
+            has_offline_hint = any(
+                phrase in answer_text.lower()
+                for phrase in ["visit", "counter", "centre", "center", "walk-in", "office", "service kiosk", "utc"]
+            )
+            if not has_offline_hint:
+                answer_text = (
+                    f"{answer_text}\n\n"
+                    "If online forms are difficult, visit the nearest government service counter for walk-in help."
+                )
+
+        if not re.search(r"[?]\s*$", answer_text.strip()):
+            answer_text = f"{answer_text.rstrip()}\n\nWould you like help with the next step?"
+
+        if ANSWER_STYLE != 'bullet':
+            answer_items = [answer_text]
+
         result = {
-            'answer': bullet_points,
+            'answer': answer_items,
+            'answer_text': answer_text,
             'language': language,
             'timestamp': datetime.now().isoformat(),
             'raw_response': llm_response
         }
         
-        print(f"   ✓ Response formatted into {len(bullet_points)} bullet points")
+        print(f"   ✓ Response formatted for style '{ANSWER_STYLE}'")
         return result
 
     # ========================================================================
@@ -1209,9 +1814,12 @@ Final bullet points:
             return [text]
 
         nlp = self.nlp_en if all(ord(ch) < 128 for ch in text[:200]) else self.nlp_multi
-        doc = nlp(text)
-        sentences = [s.text for s in doc.sents]
-        
+        try:
+            doc = nlp(text)
+            sentences = [s.text for s in doc.sents]
+        except Exception:
+            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+
         chunks = []
         current_chunk = ""
         for sentence in sentences:
@@ -1286,7 +1894,13 @@ Simplified text:
         self.debug_logs.append(message)
         print(message)  # Also print to terminal
     
-    def process_query(self, user_query: str, user_language_hint: Optional[str] = None) -> Dict[str, Any]:
+    def process_query(
+        self,
+        user_query: str,
+        user_language_hint: Optional[str] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        conversation_summary: str = "",
+    ) -> Dict[str, Any]:
         """
         Main pipeline: Process a user query end-to-end with dialect-aware translation
         
@@ -1302,6 +1916,8 @@ Simplified text:
         Args:
             user_query: User's input query in any ASEAN dialect
             user_language_hint: Optional language code from frontend (e.g., 'ms', 'en', 'zh')
+            conversation_history: Recent conversation turns for short-term memory
+            conversation_summary: Rolling summary of earlier turns
             
         Returns:
             Complete response with answer, sources, and metadata
@@ -1311,9 +1927,21 @@ Simplified text:
         
         self._log_debug("\n" + "="*70)
         self._log_debug(f"🎯 Processing Query: '{user_query}'")
+        self._log_debug(f"🧠 Conversation turns provided: {len(conversation_history or [])}")
+        self._log_debug(f"🗒️ Conversation summary length: {len(conversation_summary or '')}")
         self._log_debug("="*70 + "\n")
         
         try:
+            # Step 0: Classify query intent — skip RAG for greetings/chit-chat
+            self._log_debug("[Step 0] 🧭 Classifying query intent...")
+            intent = self.classify_query_intent(user_query)
+            self._log_debug(f"[Step 0] ✓ Intent: {intent}")
+
+            # Override: a step-gate confirmation must always run full RAG
+            if intent == 'general' and self._detect_step_confirmation(user_query, conversation_history):
+                intent = 'task_or_policy'
+                self._log_debug("[Step 0] 🔄 Step-gate confirmation detected — overriding intent to task_or_policy")
+
             # Step 1: Detect language/dialect
             self._log_debug("[Step 1] 🔍 Detecting language...")
             
@@ -1347,7 +1975,48 @@ Simplified text:
                         detected_language = 'en'
             user_nllb_code = self._get_nllb_language_code(detected_language)
             self._log_debug(f"[Step 1] ✓ Detected: {detected_language} ({user_nllb_code})")
-            
+
+            # ----------------------------------------------------------------
+            # FAST PATH: general/conversational query — no RAG needed
+            # ----------------------------------------------------------------
+            if intent == 'general':
+                self._log_debug("[Fast Path] 💬 General query — skipping vector search")
+                target_lang_for_llm = 'zsm_Latn' if user_nllb_code != 'eng_Latn' else 'eng_Latn'
+                general_prompt = self._prepare_general_prompt(
+                    user_query,
+                    target_language=target_lang_for_llm,
+                    conversation_history=conversation_history,
+                    conversation_summary=conversation_summary,
+                )
+                llm_response = self.call_llm(general_prompt)
+                final_response = self.post_process_response(
+                    llm_response, detected_language,
+                    user_query=user_query, allow_step_format=False
+                )
+                # Translate back if needed
+                if self.translation_enabled and self._needs_translation(user_nllb_code):
+                    translated_segments = []
+                    for segment in final_response['answer']:
+                        text_only = segment.lstrip('• -*').strip()
+                        trans_result = self.translate_text(
+                            text=text_only, source_lang='zsm_Latn', target_lang=user_nllb_code
+                        )
+                        translated_segments.append(
+                            trans_result['translated_text'] if trans_result['translation_performed'] else segment
+                        )
+                    final_response['answer_text'] = '\n\n'.join(translated_segments)
+                    final_response['answer'] = [final_response['answer_text']]
+                final_response['status'] = 'success'
+                final_response['intent'] = 'general'
+                final_response['rag_used'] = False
+                final_response['evidence'] = []
+                final_response['detected_language'] = detected_language
+                final_response['user_language_code'] = user_nllb_code
+                final_response['sources'] = []
+                final_response['retrieved_chunks_count'] = 0
+                final_response['debug_logs'] = self.debug_logs
+                return final_response
+
             # Check coverage: embeddings + translation
             embedding_supported = self._is_embedding_language_supported(detected_language)
             translation_supported = user_nllb_code in ASEAN_LANGUAGE_MAP.values()
@@ -1361,9 +2030,11 @@ Simplified text:
                     "Sorry, your dialect is currently not supported. "
                     "Please enter your question in Malay or English."
                 )
+                if ANSWER_STYLE == 'bullet':
+                    fallback_msg = f"• {fallback_msg}"
                 
                 return {
-                    'answer': [f"• {fallback_msg}"],
+                    'answer': [fallback_msg],
                     'language': detected_language,
                     'user_language_code': user_nllb_code,
                     'timestamp': datetime.now().isoformat(),
@@ -1417,6 +2088,8 @@ Simplified text:
             if not retrieved_chunks:
                 self._log_debug("[Step 3] ⚠️ No relevant documents found")
                 no_results_msg = "• No relevant information found for your query. Please try rephrasing."
+                if ANSWER_STYLE == 'narrative':
+                    no_results_msg = "No relevant information found for your query. Please try rephrasing."
                 
                 # Translate "no results" message back to user's language if needed
                 if self.translation_enabled and self._needs_translation(user_nllb_code):
@@ -1426,7 +2099,11 @@ Simplified text:
                         target_lang=user_nllb_code
                     )
                     if trans_result['translation_performed']:
-                        no_results_msg = "• " + trans_result['translated_text'].lstrip('• ')
+                        translated_text = trans_result['translated_text'].lstrip('• ').strip()
+                        if ANSWER_STYLE == 'bullet':
+                            no_results_msg = f"• {translated_text}"
+                        else:
+                            no_results_msg = translated_text
                 
                 return {
                     'answer': [no_results_msg],
@@ -1439,13 +2116,36 @@ Simplified text:
                 }
             
             self._log_debug(f"[Step 3] ✓ Found {len(retrieved_chunks)} relevant chunks")
-            
+
+            # Build evidence array from retrieved chunks
+            evidence = []
+            for idx, chunk in enumerate(retrieved_chunks, 1):
+                original_text = (
+                    chunk.get('content', chunk.get('text', '')) or ''
+                ).strip()
+                evidence.append({
+                    'citation_tag': f'S{idx}',
+                    'source_name': chunk.get('title', f'Source {idx}'),
+                    'source_url': chunk.get('source_url', chunk.get('url', '')),
+                    'original_excerpt': original_text[:400],
+                    'similarity': chunk.get('similarity', None),
+                })
+
             # Step 4: Prepare prompt (use pivot language for LLM)
             self._log_debug("[Step 4] 📝 Preparing LLM prompt...")
+            is_process_question = self._is_process_question(user_query)
+
+            # Step-gating: first encounter of a process question → overview only
+            step_confirmed = self._detect_step_confirmation(user_query, conversation_history)
+            use_step_gate = is_process_question and not step_confirmed
+
             prompt = self.prepare_llm_prompt(
                 query_for_retrieval,  # Use translated query
-                retrieved_chunks, 
-                'zsm_Latn' if user_nllb_code != 'eng_Latn' else 'eng_Latn'  # Ask LLM for Malay/English first
+                retrieved_chunks,
+                'zsm_Latn' if user_nllb_code != 'eng_Latn' else 'eng_Latn',  # Ask LLM for Malay/English first
+                conversation_history=conversation_history,
+                conversation_summary=conversation_summary,
+                use_step_gate=use_step_gate,
             )
             self._log_debug(f"[Step 4] ✓ Prompt prepared (length: {len(prompt)})")
             
@@ -1456,17 +2156,20 @@ Simplified text:
             
             # Step 6: Post-process
             self._log_debug("[Step 6] 🔧 Post-processing response...")
-            final_response = self.post_process_response(llm_response, detected_language)
+            final_response = self.post_process_response(
+                llm_response,
+                detected_language,
+                user_query=user_query,
+                allow_step_format=is_process_question,
+            )
             
             # Step 6.5: Translate answer back to user's dialect
             if self.translation_enabled and self._needs_translation(user_nllb_code):
                 self._log_debug(f"[Step 6.5] 🌐 Translating answer back to user's language ({user_nllb_code})...")
                 
-                # Translate each bullet point
-                translated_bullets = []
-                for bullet in final_response['answer']:
-                    # Remove bullet symbol before translation
-                    text_only = bullet.lstrip('• -*').strip()
+                translated_segments = []
+                for segment in final_response['answer']:
+                    text_only = segment.lstrip('• -*').strip()
                     
                     trans_result = self.translate_text(
                         text=text_only,
@@ -1475,17 +2178,32 @@ Simplified text:
                     )
                     
                     if trans_result['translation_performed']:
-                        translated_bullets.append(f"• {trans_result['translated_text']}")
+                        translated_segments.append(trans_result['translated_text'])
                     else:
-                        translated_bullets.append(bullet)  # Keep original if translation fails
+                        translated_segments.append(segment)
                 
-                final_response['answer'] = translated_bullets
+                if ANSWER_STYLE == 'bullet':
+                    final_response['answer'] = [
+                        segment if segment.startswith('•') else f"• {segment}"
+                        for segment in translated_segments
+                    ]
+                    final_response['answer_text'] = '\n'.join(final_response['answer'])
+                else:
+                    final_response['answer_text'] = '\n\n'.join(translated_segments)
+                    final_response['answer'] = [final_response['answer_text']]
+
                 final_response['answer_original_language'] = llm_response  # Keep original for reference
                 self._log_debug(f"[Step 6.5] ✓ Answer translated to user's language")
             else:
                 if not self.translation_enabled and user_nllb_code not in PIVOT_LANGUAGES:
                     # Add note that we're showing in Malay/English
-                    final_response['answer'].insert(0, translation_note or "⚠️ Showing results in Malay/English (translation unavailable)")
+                    note = translation_note or "⚠️ Showing results in Malay/English (translation unavailable)"
+                    if ANSWER_STYLE == 'bullet':
+                        final_response['answer'].insert(0, note)
+                        final_response['answer_text'] = '\n'.join(final_response['answer'])
+                    else:
+                        final_response['answer_text'] = f"{note}\n\n{final_response['answer_text']}"
+                        final_response['answer'] = [final_response['answer_text']]
             
             # Add metadata
             final_response['status'] = 'success'
@@ -1494,7 +2212,10 @@ Simplified text:
             final_response['user_language_code'] = user_nllb_code
             final_response['query_translated'] = query_for_retrieval != user_query
             final_response['answer_translated'] = self.translation_enabled and self._needs_translation(user_nllb_code)
-            
+            final_response['intent'] = 'task_or_policy'
+            final_response['rag_used'] = True
+            final_response['evidence'] = evidence
+
             # Add sources for frontend display
             final_response['sources'] = retrieved_chunks
             
@@ -1511,9 +2232,18 @@ Simplified text:
             self._log_debug(f"\n❌ Error processing query: {e}")
             import traceback
             self._log_debug(f"Traceback: {traceback.format_exc()}")
+
+            error_text = str(e)
+            if self._is_transient_hf_error(e):
+                user_message = (
+                    "The AI service timed out while processing your request. "
+                    "Please try again in a few seconds."
+                )
+            else:
+                user_message = f"Error: {error_text}"
             
             return {
-                'answer': [f"• Error: {str(e)}"],
+                'answer': [user_message],
                 'language': 'en',
                 'timestamp': datetime.now().isoformat(),
                 'status': 'error',

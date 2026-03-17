@@ -8,31 +8,150 @@ import {
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
+type EvidenceItem = {
+  citation_tag: string;
+  source_name: string;
+  source_url: string;
+  original_excerpt: string;
+  similarity?: number | null;
+};
+
+type ChatMessage = {
+  role: string;
+  text: string;
+  source?: string;
+  sources?: any[];
+  evidence?: EvidenceItem[];
+  intent?: string;
+  ragUsed?: boolean;
+  dialect?: string;
+  status?: string;
+  detectedLanguage?: string;
+  debugLogs?: string[];
+  originalText?: string;
+  isSimplifying?: boolean;
+};
+
+type ChatHistoryItem = {
+  role: 'user' | 'assistant';
+  text: string;
+};
+
+type ConversationRecord = {
+  id: string;
+  title: string;
+  summary: string;
+  created_at: string;
+  updated_at: string;
+  messages?: Array<{
+    role: string;
+    text: string;
+    created_at?: string;
+  }>;
+};
+
+const MAX_HISTORY_MESSAGES = 6;
+const CHAT_HISTORY_STORAGE_KEY = 'chat_history';
+const CONVERSATION_ID_STORAGE_KEY = 'current_conversation_id';
+
+const getWelcomeMessage = (): ChatMessage => ({
+  role: 'assistant',
+  text: 'Selamat Datang! I am your Public Service AI. I can explain government policies in simple language or local dialects.',
+  dialect: 'Standard Malay',
+});
+
+const formatConversationTime = (isoDate: string): string => {
+  const timestamp = new Date(isoDate).getTime();
+  if (Number.isNaN(timestamp)) {
+    return 'Recently';
+  }
+
+  const minutes = Math.max(1, Math.floor((Date.now() - timestamp) / 60000));
+  if (minutes < 60) {
+    return `${minutes} min ago`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  }
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? '' : 's'} ago`;
+};
+
 export default function InclusiveApp() {
   const [input, setInput] = useState("");
   const [language, setLanguage] = useState("ms-MY");
-  const [messages, setMessages] = useState<{ 
-    role: string; 
-    text: string; 
-    source?: string;
-    sources?: any[];
-    dialect?: string; 
-    status?: string;
-    detectedLanguage?: string;
-    debugLogs?: string[];
-    originalText?: string;
-    isSimplifying?: boolean;
-  }[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
   const [showDebugPanel, setShowDebugPanel] = useState(false);
   const [currentDebugLogs, setCurrentDebugLogs] = useState<string[]>([]);
+  const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
+  const [conversations, setConversations] = useState<ConversationRecord[]>([]);
+  const [expandedEvidence, setExpandedEvidence] = useState<Set<number>>(new Set());
   const scrollRef = useRef<HTMLDivElement>(null);
   const [previewSourceUrl, setPreviewSourceUrl] = useState<string | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const [isTranscribing, setIsTranscribing] = useState(false);
+
+  const syncLocalMessages = (nextMessages: ChatMessage[]) => {
+    setMessages(nextMessages);
+    localStorage.setItem(CHAT_HISTORY_STORAGE_KEY, JSON.stringify(nextMessages));
+  };
+
+  const refreshConversations = async () => {
+    const response = await fetch('/api/conversations', { cache: 'no-store' });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.error || 'Failed to load conversations');
+    }
+    setConversations(result.conversations || []);
+    return result.conversations || [];
+  };
+
+  const loadConversation = async (conversationId: string) => {
+    const response = await fetch(`/api/conversations/${conversationId}`, { cache: 'no-store' });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.error || 'Failed to load conversation');
+    }
+
+    const nextMessages = result.messages && result.messages.length > 0
+      ? result.messages.map((message: { role: string; text: string }) => ({
+          role: message.role,
+          text: message.text,
+        }))
+      : [getWelcomeMessage()];
+
+    setCurrentConversationId(result.id);
+    localStorage.setItem(CONVERSATION_ID_STORAGE_KEY, result.id);
+    syncLocalMessages(nextMessages);
+    setCurrentDebugLogs([]);
+    setPreviewSourceUrl(null);
+    return result as ConversationRecord;
+  };
+
+  const createConversation = async () => {
+    const response = await fetch('/api/conversations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.error || 'Failed to create conversation');
+    }
+
+    setCurrentConversationId(result.id);
+    localStorage.setItem(CONVERSATION_ID_STORAGE_KEY, result.id);
+    syncLocalMessages([getWelcomeMessage()]);
+    setCurrentDebugLogs([]);
+    setPreviewSourceUrl(null);
+    await refreshConversations();
+    return result as ConversationRecord;
+  };
 
   // Auto-scroll to bottom on new message
   useEffect(() => {
@@ -42,16 +161,45 @@ export default function InclusiveApp() {
   }, [messages, isTyping]);
 
   useEffect(() => {
-    const savedMessages = localStorage.getItem('chat_history');
-    if (savedMessages) {
-      setMessages(JSON.parse(savedMessages));
-    } else {
-      setMessages([{ 
-        role: 'assistant', 
-        text: "Selamat Datang! I am your Public Service AI. I can explain government policies in simple language or local dialects.",
-        dialect: "Standard Malay"
-      }]);
-    }
+    let isMounted = true;
+
+    const bootstrapConversation = async () => {
+      const savedConversationId = localStorage.getItem(CONVERSATION_ID_STORAGE_KEY);
+
+      try {
+        const availableConversations = await refreshConversations();
+        if (!isMounted) return;
+
+        if (savedConversationId) {
+          const matchingConversation = availableConversations.find((conversation: ConversationRecord) => conversation.id === savedConversationId);
+          if (matchingConversation) {
+            await loadConversation(savedConversationId);
+            return;
+          }
+        }
+
+        if (availableConversations.length > 0) {
+          await loadConversation(availableConversations[0].id);
+          return;
+        }
+
+        await createConversation();
+      } catch (error) {
+        console.error('Conversation bootstrap failed:', error);
+        const savedMessages = localStorage.getItem(CHAT_HISTORY_STORAGE_KEY);
+        if (savedMessages) {
+          setMessages(JSON.parse(savedMessages));
+        } else {
+          setMessages([getWelcomeMessage()]);
+        }
+      }
+    };
+
+    bootstrapConversation();
+
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
   const toggleListening = async () => {
@@ -162,11 +310,27 @@ export default function InclusiveApp() {
 
     // Add user message to chat
     const newMessages = [...messages, { role: 'user', text: textToSend }];
-    setMessages(newMessages);
+    syncLocalMessages(newMessages);
     setInput("");
     setIsTyping(true);
+
+    const conversationHistory: ChatHistoryItem[] = newMessages
+      .filter((message): message is ChatMessage & { role: 'user' | 'assistant' } =>
+        (message.role === 'user' || message.role === 'assistant') && !!message.text?.trim()
+      )
+      .slice(-MAX_HISTORY_MESSAGES)
+      .map((message) => ({
+        role: message.role,
+        text: message.text.trim(),
+      }));
     
     try {
+      let activeConversationId = currentConversationId;
+      if (!activeConversationId) {
+        const createdConversation = await createConversation();
+        activeConversationId = createdConversation.id;
+      }
+
       // Call Python RAG backend via Next.js API route
       const response = await fetch('/api/chat', {
         method: 'POST',
@@ -174,6 +338,8 @@ export default function InclusiveApp() {
         body: JSON.stringify({ 
           query: textToSend,
           top_k: 5,
+          conversation_id: activeConversationId,
+          conversation_history: conversationHistory,
         }),
       });
 
@@ -211,32 +377,37 @@ export default function InclusiveApp() {
           text: result.answer,
           source: sourceUrl,
           sources: result.sources, // Store all sources
+          evidence: result.evidence || [],
+          intent: result.intent,
+          ragUsed: result.rag_used,
           dialect: detectedLanguage,
           detectedLanguage: result.detected_language,
           status: result.success ? 'verified' : 'no_results',
           debugLogs: result.debug_logs || []
         };
 
-        setMessages(prev => [...prev, assistantMessage]);
+        const updatedMessages = [...newMessages, assistantMessage];
+        syncLocalMessages(updatedMessages);
+        if (result.conversation_id) {
+          setCurrentConversationId(result.conversation_id);
+          localStorage.setItem(CONVERSATION_ID_STORAGE_KEY, result.conversation_id);
+        }
         
         // Update debug logs display
         if (result.debug_logs && result.debug_logs.length > 0) {
           setCurrentDebugLogs(result.debug_logs);
         }
-
-        // Update localStorage
-        const updatedMessages = [...newMessages, assistantMessage];
-        localStorage.setItem('chat_history', JSON.stringify(updatedMessages));
+        await refreshConversations();
       } else if (result.error) {
         // Actual error with error message
-        setMessages(prev => [...prev, { 
+        syncLocalMessages([...newMessages, { 
           role: 'assistant', 
           text: result.error,
           dialect: "Error"
         }]);
       } else {
         // Unknown error
-        setMessages(prev => [...prev, { 
+        syncLocalMessages([...newMessages, { 
           role: 'assistant', 
           text: "Sorry, I couldn't process your request. Please try again.",
           dialect: "Error"
@@ -246,7 +417,7 @@ export default function InclusiveApp() {
       setIsTyping(false);
       console.error('Chat error:', error);
       
-      setMessages(prev => [...prev, { 
+      syncLocalMessages([...newMessages, { 
         role: 'assistant', 
         text: "I'm having trouble connecting to the backend. Please ensure both servers are running:\n\n• Python backend: http://localhost:8000\n• Next.js frontend: http://localhost:3001",
         dialect: "Connection Error"
@@ -279,7 +450,10 @@ export default function InclusiveApp() {
           </div>
           
           <button 
-            onClick={() => {setMessages([]); setIsSidebarOpen(false);}} 
+            onClick={async () => {
+              await createConversation();
+              setIsSidebarOpen(false);
+            }} 
             className="flex items-center justify-center gap-2 w-full py-3 px-4 mb-6 rounded-xl bg-slate-900 text-white font-semibold hover:bg-slate-800 transition-all shadow-sm active:scale-95"
           >
             <PlusCircle size={18}/> New Session
@@ -288,10 +462,26 @@ export default function InclusiveApp() {
           <div className="flex-1 overflow-y-auto">
             <p className="text-[11px] font-bold text-slate-400 uppercase tracking-[0.15em] mb-4">Recent Conversations</p>
             <div className="space-y-3">
-               <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 text-sm text-slate-500 cursor-pointer hover:border-emerald-300 transition-colors">
-                 <p className="font-semibold text-slate-700 mb-1">Health Subsidy Query</p>
-                 <p className="text-xs opacity-70">2 hours ago</p>
-               </div>
+              {conversations.map((conversation) => (
+                <button
+                  key={conversation.id}
+                  onClick={async () => {
+                    await loadConversation(conversation.id);
+                    setIsSidebarOpen(false);
+                  }}
+                  className={`w-full p-4 text-left rounded-xl border text-sm transition-colors ${
+                    currentConversationId === conversation.id
+                      ? 'bg-emerald-50 border-emerald-300 text-slate-700'
+                      : 'bg-slate-50 border-slate-200 text-slate-500 hover:border-emerald-300'
+                  }`}
+                >
+                  <p className="font-semibold text-slate-700 mb-1 line-clamp-2">{conversation.title}</p>
+                  <p className="text-xs opacity-70 line-clamp-2">
+                    {conversation.summary || 'Conversation stored on server'}
+                  </p>
+                  <p className="text-[11px] opacity-60 mt-2">{formatConversationTime(conversation.updated_at)}</p>
+                </button>
+              ))}
             </div>
           </div>
         </div>
@@ -337,8 +527,20 @@ export default function InclusiveApp() {
               }`}>
                 
                 {m.role === 'assistant' && m.dialect && (
-                  <div className="flex items-center gap-1.5 mb-3 text-[10px] font-bold uppercase tracking-widest text-emerald-700">
-                    <Languages size={14} className="opacity-70" /> {m.dialect}
+                  <div className="flex items-center gap-2 mb-3 flex-wrap">
+                    <div className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-emerald-700">
+                      <Languages size={14} className="opacity-70" /> {m.dialect}
+                    </div>
+                    {m.ragUsed === true && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider bg-blue-50 text-blue-600 border border-blue-200">
+                        <Search size={10} /> RAG Verified
+                      </span>
+                    )}
+                    {m.ragUsed === false && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider bg-slate-100 text-slate-500 border border-slate-200">
+                        💬 Direct Answer
+                      </span>
+                    )}
                   </div>
                 )}
 
@@ -415,6 +617,59 @@ export default function InclusiveApp() {
                             </div>
                           );
                         })}
+                      </div>
+                    )}
+
+                    {/* Evidence section — original source excerpts with citation tags */}
+                    {m.evidence && m.evidence.length > 0 && (
+                      <div className="space-y-1">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setExpandedEvidence(prev => {
+                              const next = new Set(prev);
+                              if (next.has(i)) next.delete(i); else next.add(i);
+                              return next;
+                            });
+                          }}
+                          className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-400 hover:text-slate-600 transition-colors"
+                        >
+                          <FileText size={12} />
+                          {expandedEvidence.has(i) ? '▾' : '▸'} Original Source Excerpts ({m.evidence.length})
+                        </button>
+                        {expandedEvidence.has(i) && (
+                          <div className="space-y-2 mt-2">
+                            {m.evidence.map((ev: EvidenceItem, evIdx: number) => (
+                              <div key={evIdx} className="bg-amber-50 border border-amber-200 rounded-xl p-3">
+                                <div className="flex items-center justify-between mb-1.5">
+                                  <span className="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full">
+                                    [{ev.citation_tag}]
+                                  </span>
+                                  <span className="text-[10px] text-slate-500 font-medium truncate ml-2 flex-1 text-right">
+                                    {ev.source_name}
+                                    {ev.similarity != null && (
+                                      <span className="ml-1 text-emerald-600">
+                                        · {(ev.similarity * 100).toFixed(0)}% match
+                                      </span>
+                                    )}
+                                  </span>
+                                </div>
+                                <p className="text-[11px] text-slate-600 italic leading-relaxed line-clamp-4">
+                                  &ldquo;{ev.original_excerpt}&rdquo;
+                                </p>
+                                {ev.source_url && (
+                                  <button
+                                    type="button"
+                                    onClick={() => window.open(ev.source_url, '_blank')}
+                                    className="mt-1.5 text-[10px] text-emerald-600 hover:underline flex items-center gap-1"
+                                  >
+                                    <ExternalLink size={10} /> View source
+                                  </button>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     )}
 

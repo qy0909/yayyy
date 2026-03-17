@@ -16,8 +16,8 @@ if response.data:
     # Check what model creates this dimension
     from sentence_transformers import SentenceTransformer
     
-    model = SentenceTransformer('distiluse-base-multilingual-cased-v2')
+    model = SentenceTransformer('BAAI/bge-m3')
     test_embedding = model.encode("test")
-    print(f"   distiluse-base-multilingual-cased-v2 dimension: {len(test_embedding)}")
+    print(f"   BAAI/bge-m3 dimension: {len(test_embedding)}")
 else:
     print("No data found")

@@ -41,8 +41,10 @@ try:
             print(f"   Dimension: {len(embedding)}")
             print(f"   First 5 values: {embedding[:5]}")
             
-            if len(embedding) == 512:
-                print(f"\n   ✅ PERFECT! Matches distiluse-base-multilingual-cased-v2 (512 dims)")
+            if len(embedding) == 1024:
+                print(f"\n   ✅ PERFECT! Matches BAAI/bge-m3 (1024 dims)")
+            elif len(embedding) == 512:
+                print(f"\n   ⚠️  Uses 512 dimensions (distiluse-base-multilingual-cased-v2)")
             elif len(embedding) == 384:
                 print(f"\n   ⚠️  Uses 384 dimensions (all-MiniLM-L6-v2 model)")
                 print(f"   Update RAG.py to use: 'all-MiniLM-L6-v2'")
@@ -57,7 +59,7 @@ try:
             print(f"\n   🚨 PROBLEM: Embeddings are stored as text, not vectors!")
             print(f"   This prevents vector search from working.")
             print(f"\n   FIX: Run the SQL commands in FIX_SUPABASE.md to:")
-            print(f"   1. Recreate table with vector(512) type")
+            print(f"   1. Recreate table with vector(1024) type")
             print(f"   2. Re-upload documents using uploader.py")
         else:
             print(f"   ❌ Unexpected type: {type(embedding)}")
@@ -66,14 +68,14 @@ try:
     print(f"\n🔍 Checking vector search function...")
     try:
         # Try calling match_documents with a dummy vector
-        test_vector = [0.0] * 512
+        test_vector = [0.0] * 1024
         result = supabase.rpc('match_documents', {
             'query_embedding': test_vector,
             'match_count': 1,
             'similarity_threshold': 0.1
         }).execute()
         print(f"   ✅ RPC function 'match_documents' exists")
-        print(f"   Expected dimension: 512")
+        print(f"   Expected dimension: 1024")
     except Exception as e:
         error_msg = str(e).lower()
         if 'different vector dimensions' in error_msg:
@@ -101,7 +103,8 @@ print("\n" + "=" * 70)
 print("SUMMARY")
 print("=" * 70)
 print("\nWhat dimension should you use?")
-print("  • 512 dims  →  distiluse-base-multilingual-cased-v2 (RECOMMENDED)")
+print("  • 1024 dims →  BAAI/bge-m3 (RECOMMENDED)")
+print("  • 512 dims  →  distiluse-base-multilingual-cased-v2")
 print("  • 384 dims  →  all-MiniLM-L6-v2")
 print("  • 768 dims  →  paraphrase-multilingual-mpnet-base-v2")
 print("\nMake sure:")
