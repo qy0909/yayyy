@@ -102,13 +102,21 @@ export default function InclusiveApp() {
   };
 
   const refreshConversations = async () => {
-    const response = await fetch('/api/conversations', { cache: 'no-store' });
-    const result = await response.json();
-    if (!response.ok) {
-      throw new Error(result.error || 'Failed to load conversations');
+    try {
+      const response = await fetch('/api/conversations', { cache: 'no-store' });
+      const result = await response.json();
+      if (!response.ok) {
+        console.warn('Failed to load conversations:', result?.error || response.statusText);
+        setConversations([]);
+        return [];
+      }
+      setConversations(result.conversations || []);
+      return result.conversations || [];
+    } catch (error) {
+      console.warn('Failed to load conversations:', error);
+      setConversations([]);
+      return [];
     }
-    setConversations(result.conversations || []);
-    return result.conversations || [];
   };
 
   const loadConversation = async (conversationId: string) => {
@@ -134,23 +142,33 @@ export default function InclusiveApp() {
   };
 
   const createConversation = async () => {
-    const response = await fetch('/api/conversations', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    });
-    const result = await response.json();
-    if (!response.ok) {
-      throw new Error(result.error || 'Failed to create conversation');
-    }
+    try {
+      const response = await fetch('/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.error || 'Failed to create conversation');
+      }
 
-    setCurrentConversationId(result.id);
-    localStorage.setItem(CONVERSATION_ID_STORAGE_KEY, result.id);
-    syncLocalMessages([getWelcomeMessage()]);
-    setCurrentDebugLogs([]);
-    setPreviewSourceUrl(null);
-    await refreshConversations();
-    return result as ConversationRecord;
+      setCurrentConversationId(result.id);
+      localStorage.setItem(CONVERSATION_ID_STORAGE_KEY, result.id);
+      syncLocalMessages([getWelcomeMessage()]);
+      setCurrentDebugLogs([]);
+      setPreviewSourceUrl(null);
+      await refreshConversations();
+      return result as ConversationRecord;
+    } catch (error) {
+      console.warn('Failed to create conversation, falling back to local chat:', error);
+      setCurrentConversationId(null);
+      localStorage.removeItem(CONVERSATION_ID_STORAGE_KEY);
+      syncLocalMessages([getWelcomeMessage()]);
+      setCurrentDebugLogs([]);
+      setPreviewSourceUrl(null);
+      return null;
+    }
   };
 
   // Auto-scroll to bottom on new message
@@ -185,7 +203,7 @@ export default function InclusiveApp() {
 
         await createConversation();
       } catch (error) {
-        console.error('Conversation bootstrap failed:', error);
+        console.warn('Conversation bootstrap fallback activated:', error);
         const savedMessages = localStorage.getItem(CHAT_HISTORY_STORAGE_KEY);
         if (savedMessages) {
           setMessages(JSON.parse(savedMessages));

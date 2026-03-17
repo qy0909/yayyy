@@ -20,8 +20,14 @@ from pydantic import BaseModel, ConfigDict
 from typing import Optional, List, Dict, Any
 import uvicorn
 from dotenv import load_dotenv
-import whisper #voice processing
 from conversation_store import ConversationStore
+
+try:
+    import whisper  # type: ignore
+    WHISPER_IMPORT_ERROR = None
+except Exception as whisper_error:
+    whisper = None
+    WHISPER_IMPORT_ERROR = whisper_error
 
 # Load environment variables
 load_dotenv()
@@ -33,7 +39,23 @@ app = FastAPI(
     version="1.0.0"
 )
 
-stt_model = whisper.load_model("base", device="cpu")
+stt_model = None
+
+
+def get_stt_model():
+    """Lazy-load Whisper model so backend can start even if STT deps are missing."""
+    global stt_model
+    if stt_model is not None:
+        return stt_model
+
+    if whisper is None:
+        raise RuntimeError(
+            "Whisper STT is not available. Install openai-whisper and ffmpeg, "
+            f"then restart backend. Import error: {WHISPER_IMPORT_ERROR}"
+        )
+
+    stt_model = whisper.load_model("base", device="cpu")
+    return stt_model
 
 # Lazy import RAG Pipeline (loaded on first use to avoid startup issues)
 RAGPipeline = None
@@ -209,14 +231,15 @@ async def health_check():
 
 @app.post("/transcribe")
 async def transcribe_voice(file: UploadFile = File(...)):
+    temp_path = "temp_voice_input.wav"
     try:
         # Save the incoming audio blob to a temporary file
-        temp_path = "temp_voice_input.wav"
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
         # Run Whisper transcription
-        result = stt_model.transcribe(temp_path, fp16=False)
+        model = get_stt_model()
+        result = model.transcribe(temp_path, fp16=False)
         
         print(f"Transcribed: {result['text']}")
         
@@ -228,6 +251,9 @@ async def transcribe_voice(file: UploadFile = File(...)):
     except Exception as e:
         print(f"❌ STT Error: {e}")
         return {"success": False, "error": str(e)}
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 @app.post("/api/chat", response_model=QueryResponse)
 async def chat(request: QueryRequest):
