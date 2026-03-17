@@ -1,5 +1,6 @@
 import os
 import glob
+from multiprocessing import freeze_support
 from dotenv import load_dotenv 
 from supabase import create_client
 from sentence_transformers import SentenceTransformer
@@ -18,13 +19,34 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 else:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# UPDATED: Using BAAI/bge-m3 (1024 dimensions)
-print("Loading BAAI/bge-m3 model (this may take a moment)...")
-model = SentenceTransformer('BAAI/bge-m3')
+model = None
+
+
+def get_model():
+    """Lazy-load the embedding model to avoid Windows spawn import issues."""
+    global model
+    if model is None:
+        print("Loading BAAI/bge-m3 model (this may take a moment)...")
+        model = SentenceTransformer('BAAI/bge-m3')
+    return model
+
+
+def infer_document_type(file_name, source_url, content):
+    """Infer a coarse category for Supabase document_type."""
+    text = f"{file_name} {source_url} {content[:400]}".lower()
+
+    if any(k in text for k in ["welfare", "sara", "str", "aid", "bantuan", "mykasih"]):
+        return "welfare"
+    if any(k in text for k in ["immigration", "immigrant", "permit", "visa", "migrant", "pekerja asing", "fomema"]):
+        return "immigration"
+    if any(k in text for k in ["health", "hospital", "clinic", "medical", "kesihatan", "covid"]):
+        return "healthcare"
+
+    return "government_doc"
 
 def get_embedding(text):
     # bge-m3 is optimized for dense retrieval
-    return model.encode(text, normalize_embeddings=True).tolist()
+    return get_model().encode(text, normalize_embeddings=True).tolist()
 
 def create_chunks(text, size, overlap):
     chunks = []
@@ -55,6 +77,7 @@ def upload_all_markdown_files():
             content = "".join(lines)
 
         chunks = create_chunks(content, CHUNK_SIZE, CHUNK_OVERLAP)
+        doc_type = infer_document_type(file_name, source_url, content)
         print(f"✂️ Slicing {file_name} into {len(chunks)} chunks...")
 
         for index, chunk_text in enumerate(chunks):
@@ -66,7 +89,7 @@ def upload_all_markdown_files():
                 "title": unique_title,
                 "source_url": source_url,
                 "language": "ms",
-                "document_type": "government_doc", 
+                "document_type": doc_type,
                 "region": "Malaysia"
             }
 
@@ -78,4 +101,5 @@ def upload_all_markdown_files():
         print(f"✅ Finished {file_name}")
 
 if __name__ == "__main__":
+    freeze_support()
     upload_all_markdown_files()
