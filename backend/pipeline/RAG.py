@@ -1931,6 +1931,7 @@ Always:
         language: str,
         user_query: str = "",
         allow_step_format: bool = False,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         """
         Format the LLM response for frontend display
@@ -1940,6 +1941,7 @@ Always:
             language: Detected/target language
             user_query: Original user query for safety-tailored response guards
             allow_step_format: Preserve numbered step layout for process questions
+            conversation_history: Recent conversation for context awareness (to avoid redundant questions)
             
         Returns:
             Formatted response dictionary
@@ -2053,8 +2055,45 @@ Always:
                     "If online forms are difficult, visit the nearest government service counter for walk-in help."
                 )
 
-        if FORCE_FOLLOW_UP_QUESTION and not re.search(r"[?]\s*$", answer_text.strip()) and '[STEP_GATE]' not in answer_text:
-            answer_text = f"{answer_text.rstrip()}\n\nWould you like help with the next step?"
+        # Language-specific follow-up questions (avoid asking if already a question at the end)
+        self._should_add_followup = False
+        if FORCE_FOLLOW_UP_QUESTION and '[STEP_GATE]' not in answer_text:
+            # Check if response already ends with a question
+            answer_stripped = answer_text.strip()
+            already_has_question = re.search(r"[?]\s*$", answer_stripped)
+            
+            # Check if user just answered affirmatively to a prior yes/no question
+            # (to avoid asking the same thing again)
+            is_user_confirming = False
+            if conversation_history:
+                # Look for recent yes/no question from assistant + user confirming with yes/yeah/ok
+                last_assistant_msg = None
+                for turn in reversed(conversation_history):
+                    if (turn.get('role') or '').lower() == 'assistant':
+                        last_assistant_msg = turn.get('text', '')
+                        break
+                
+                if last_assistant_msg and re.search(r"[?]\s*$", last_assistant_msg.strip()):
+                    # Last assistant message was a question; check if current user query is confirmation
+                    user_query_lower = (user_query or '').lower().strip()
+                    confirmation_patterns = ['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'please', 'go ahead']
+                    is_user_confirming = any(user_query_lower.startswith(p) for p in confirmation_patterns)
+            
+            if not already_has_question and not is_user_confirming:
+                # Add language-specific follow-up question
+                followup_questions = {
+                    'en': 'Would you like help with the next step?',
+                    'ms': 'Adakah anda memerlukan bantuan untuk langkah seterusnya?',
+                    'id': 'Apakah anda memerlukan bantuan untuk langkah berikutnya?',
+                    'tl': 'Kailangan mo ba ng tulong para sa susunod na hakbang?',
+                    'jv': 'Apa kowe perlu bantuan kanggo langkah sabanjure?',
+                    'th': 'คุณต้องการความช่วยเหลือสำหรับขั้นตอนถัดไปหรือไม่?',
+                    'vi': 'Bạn có cần giúp đỡ cho bước tiếp theo không?',
+                }
+                lang_code = language if language in followup_questions else 'en'
+                followup_text = followup_questions[lang_code]
+                answer_text = f"{answer_text.rstrip()}\n\n{followup_text}"
+                self._should_add_followup = True
 
         if ANSWER_STYLE != 'bullet':
             answer_items = [answer_text]
@@ -2294,7 +2333,8 @@ Simplified text:
                 llm_response = self.call_llm(general_prompt)
                 final_response = self.post_process_response(
                     llm_response, detected_language,
-                    user_query=user_query, allow_step_format=False
+                    user_query=user_query, allow_step_format=False,
+                    conversation_history=conversation_history
                 )
                 # Translate back if needed
                 if (
@@ -2483,6 +2523,7 @@ Simplified text:
                 detected_language,
                 user_query=user_query,
                 allow_step_format=is_process_question,
+                conversation_history=conversation_history,
             )
             
             # Step 6.5: Translate answer back to user's dialect
