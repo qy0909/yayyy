@@ -21,7 +21,6 @@ else:
 
 model = None
 
-
 def get_model():
     """Lazy-load the embedding model to avoid Windows spawn import issues."""
     global model
@@ -29,7 +28,6 @@ def get_model():
         print("Loading BAAI/bge-m3 model (this may take a moment)...")
         model = SentenceTransformer('BAAI/bge-m3')
     return model
-
 
 def infer_document_type(file_name, source_url, content):
     """Infer a coarse category for Supabase document_type."""
@@ -45,7 +43,6 @@ def infer_document_type(file_name, source_url, content):
     return "government_doc"
 
 def get_embedding(text):
-    # bge-m3 is optimized for dense retrieval
     return get_model().encode(text, normalize_embeddings=True).tolist()
 
 def create_chunks(text, size, overlap):
@@ -66,9 +63,13 @@ def upload_all_markdown_files():
     for file_path in files:
         file_name = os.path.basename(file_path)
         
+        # 1. CLEAN TITLE: 'employment_act_1955.md' -> 'Employment Act 1955'
+        display_name = file_name.replace(".md", "").replace("_", " ").title()
+
         with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
             
+        # 2. SOURCE & CONTENT LOGIC (FIXED NameError)
         source_url = "https://www.malaysia.gov.my/" 
         if lines and lines[0].startswith("SOURCE_URL:"):
             source_url = lines[0].replace("SOURCE_URL:", "").strip()
@@ -78,15 +79,18 @@ def upload_all_markdown_files():
 
         chunks = create_chunks(content, CHUNK_SIZE, CHUNK_OVERLAP)
         doc_type = infer_document_type(file_name, source_url, content)
-        print(f"✂️ Slicing {file_name} into {len(chunks)} chunks...")
+        
+        print(f"✂️ Slicing {display_name} into {len(chunks)} chunks...")
 
         for index, chunk_text in enumerate(chunks):
-            unique_title = f"{file_name}_chunk_{index}"
-            
+            # 3. READABLE DISPLAY TITLE: 'Employment Act 1955 (Section 2)'
+            # We use this as the UNIQUE key so citations look clean in the UI
+            readable_title = f"{display_name} (Section {index + 1})"
+
             data = {
                 "content": chunk_text,
-                "embedding": get_embedding(chunk_text), # Now 1024 dims
-                "title": unique_title,
+                "embedding": get_embedding(chunk_text),
+                "title": readable_title,
                 "source_url": source_url,
                 "language": "ms",
                 "document_type": doc_type,
@@ -94,9 +98,10 @@ def upload_all_markdown_files():
             }
 
             try:
+                # Upsert based on the new readable title
                 supabase.table("embeddings").upsert(data, on_conflict="title").execute()
             except Exception as e:
-                print(f"❌ Error uploading {unique_title}: {e}")
+                print(f"❌ Error uploading {readable_title}: {e}")
         
         print(f"✅ Finished {file_name}")
 
