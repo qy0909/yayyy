@@ -213,6 +213,8 @@ ENABLE_LANGUAGE_AUTO_DETECTION = os.getenv('ENABLE_LANGUAGE_AUTO_DETECTION', 'tr
 
 # K-shot examples for low-resource languages/dialects (comma-separated language codes)
 # Examples: 'ms,tl,th,vi' to enable k-shot examples for Malay, Tagalog, Thai, Vietnamese
+
+
 LOW_RESOURCE_LANGUAGE_EXAMPLES = os.getenv('LOW_RESOURCE_LANGUAGE_EXAMPLES', 'ms,tl,th').lower().split(',')
 
 # K-shot prompt budget controls

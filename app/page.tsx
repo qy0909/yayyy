@@ -98,6 +98,7 @@ export default function InclusiveApp() {
   const [isTyping, setIsTyping] = useState(false);
   const [showDebugPanel, setShowDebugPanel] = useState(false);
   const [currentDebugLogs, setCurrentDebugLogs] = useState<string[]>([]);
+  const [warmupStatus, setWarmupStatus] = useState<'checking' | 'warming' | 'ready' | 'failed'>('checking');
   const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
   const [conversations, setConversations] = useState<ConversationRecord[]>([]);
   const [expandedEvidence, setExpandedEvidence] = useState<Set<number>>(new Set());
@@ -151,9 +152,17 @@ export default function InclusiveApp() {
     }
 
     const nextMessages = result.messages && result.messages.length > 0
-      ? result.messages.map((message: { role: string; text: string }) => ({
+      ? result.messages.map((message: any) => ({
           role: message.role,
           text: message.text,
+          sources: message.sources || [],
+          evidence: message.evidence || [],
+          detectedLanguage: message.detectedLanguage,
+          intent: message.intent,
+          ragUsed: message.ragUsed,
+          status: message.status,
+          debugLogs: message.debugLogs || [],
+          created_at: message.created_at,
         }))
       : [getWelcomeMessage()];
 
@@ -908,7 +917,7 @@ export default function InclusiveApp() {
                             // If already simplified, revert to original
                             const updatedMessages = messages.map((msg, index) => {
                               if (index === i) {
-                                return { ...msg, text: msg.originalText, originalText: undefined };
+                                return { ...msg, text: msg.originalText ?? msg.text, originalText: undefined };
                               }
                               return msg;
                             });

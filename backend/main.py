@@ -203,6 +203,17 @@ class ConversationMessage(BaseModel):
     role: str
     text: str
     created_at: Optional[str] = None
+    # Metadata fields that can be stored
+    sources: Optional[List[Dict[str, Any]]] = None
+    evidence: Optional[List[Dict[str, Any]]] = None
+    detectedLanguage: Optional[str] = None
+    intent: Optional[str] = None
+    ragUsed: Optional[bool] = None
+    status: Optional[str] = None
+    debugLogs: Optional[List[str]] = None
+    
+    class Config:
+        extra = "allow"  # Allow any extra fields to pass through
 
 
 class ConversationResponse(BaseModel):
@@ -369,7 +380,18 @@ async def chat(request: QueryRequest):
         if isinstance(answer_text, list):
             answer_text = "\n".join(answer_text)
 
-        conversation_store.append_message(conversation_id, "assistant", answer_text)
+        # Prepare metadata for assistant message
+        assistant_metadata = {
+            "sources": result.get("sources", []),
+            "evidence": result.get("evidence", []),
+            "detectedLanguage": result.get("detected_language", result.get("language", "unknown")),
+            "intent": result.get("intent", "task_or_policy"),
+            "ragUsed": result.get("rag_used", True),
+            "status": result.get("status", "unknown"),
+            "debugLogs": result.get("debug_logs", []),
+        }
+        
+        conversation_store.append_message(conversation_id, "assistant", answer_text, metadata=assistant_metadata)
         conversation = conversation_store.refresh_summary(conversation_id)
         
         # Get detected language (RAG returns 'language' field, not 'detected_language')

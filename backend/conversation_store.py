@@ -42,11 +42,19 @@ class ConversationStore:
                     conversation_id TEXT NOT NULL,
                     role TEXT NOT NULL,
                     text TEXT NOT NULL,
+                    metadata TEXT DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (conversation_id) REFERENCES conversations(id)
                 );
                 """
             )
+            
+            # Migration: Add metadata column if it doesn't exist (for existing databases)
+            try:
+                connection.execute("SELECT metadata FROM messages LIMIT 1")
+            except sqlite3.OperationalError:
+                connection.execute("ALTER TABLE messages ADD COLUMN metadata TEXT DEFAULT '{}'")
+                connection.commit()
 
     def create_conversation(self, title: Optional[str] = None) -> Dict[str, Any]:
         conversation_id = str(uuid.uuid4())
@@ -76,6 +84,7 @@ class ConversationStore:
         return [dict(row) for row in rows]
 
     def get_conversation(self, conversation_id: str) -> Dict[str, Any]:
+        import json
         with self._connect() as connection:
             conversation = connection.execute(
                 "SELECT id, title, summary, summary_message_count, created_at, updated_at FROM conversations WHERE id = ?",
@@ -85,12 +94,31 @@ class ConversationStore:
                 raise KeyError(f"Conversation not found: {conversation_id}")
 
             messages = connection.execute(
-                "SELECT role, text, created_at FROM messages WHERE conversation_id = ? ORDER BY id ASC",
+                "SELECT role, text, metadata, created_at FROM messages WHERE conversation_id = ? ORDER BY id ASC",
                 (conversation_id,),
             ).fetchall()
 
         payload = dict(conversation)
-        payload["messages"] = [dict(message) for message in messages]
+        payload["messages"] = []
+        
+        for message in messages:
+            msg_dict = dict(message)
+            metadata_str = msg_dict.get("metadata")
+            
+            # Parse metadata JSON if it exists
+            if metadata_str:
+                try:
+                    metadata = json.loads(metadata_str)
+                    # Merge metadata fields into the message
+                    for key, value in metadata.items():
+                        msg_dict[key] = value
+                except (json.JSONDecodeError, TypeError) as e:
+                    pass
+            
+            # Remove the raw metadata field since it's merged into the message
+            msg_dict.pop("metadata", None)
+            payload["messages"].append(msg_dict)
+            
         return payload
 
     def get_recent_messages(self, conversation_id: str, limit: int = SUMMARY_KEEP_RECENT_MESSAGES) -> List[Dict[str, str]]:
@@ -108,16 +136,19 @@ class ConversationStore:
 
         return [dict(row) for row in reversed(rows)]
 
-    def append_message(self, conversation_id: str, role: str, text: str) -> None:
+    def append_message(self, conversation_id: str, role: str, text: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        import json
         message_text = (text or "").strip()
         if not message_text:
             return
 
         now = datetime.now().isoformat()
+        metadata_json = json.dumps(metadata or {})
+        
         with self._lock, self._connect() as connection:
             connection.execute(
-                "INSERT INTO messages (conversation_id, role, text, created_at) VALUES (?, ?, ?, ?)",
-                (conversation_id, role, message_text, now),
+                "INSERT INTO messages (conversation_id, role, text, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
+                (conversation_id, role, message_text, metadata_json, now),
             )
             conversation = connection.execute(
                 "SELECT title FROM conversations WHERE id = ?",
