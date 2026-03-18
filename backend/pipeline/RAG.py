@@ -29,6 +29,7 @@ from langdetect import detect, detect_langs
 from openai import OpenAI
 from supabase import create_client, Client
 import spacy
+from .kshot_library import KSHOT_LIBRARY
 
 # 🔧 HACKATHON: Southeast Asian LLM Support (Hugging Face Transformers)
 try:
@@ -213,6 +214,10 @@ ENABLE_LANGUAGE_AUTO_DETECTION = os.getenv('ENABLE_LANGUAGE_AUTO_DETECTION', 'tr
 # K-shot examples for low-resource languages/dialects (comma-separated language codes)
 # Examples: 'ms,tl,th,vi' to enable k-shot examples for Malay, Tagalog, Thai, Vietnamese
 LOW_RESOURCE_LANGUAGE_EXAMPLES = os.getenv('LOW_RESOURCE_LANGUAGE_EXAMPLES', 'ms,tl,th').lower().split(',')
+
+# K-shot prompt budget controls
+KSHOT_MAX_EXAMPLES_PER_LANGUAGE = int(os.getenv('KSHOT_MAX_EXAMPLES_PER_LANGUAGE', '4'))
+KSHOT_MAX_TOTAL_CHARS = int(os.getenv('KSHOT_MAX_TOTAL_CHARS', '5000'))
 
 # Reduce chunk size before sending retrieved context to the LLM
 CHUNK_SUMMARY_MAX_CHARS = 700 if SPEED_MODE else 900
@@ -1348,7 +1353,7 @@ Instructions:
 6. Do not start with stock phrases like \"Here's a helpful response\" or \"Certainly!\".
 """
 
-    def _build_multilingual_kshot_examples(self) -> str:
+    def _build_multilingual_kshot_examples(self, user_query: str = "") -> str:
         """
         Build k-shot examples for low-resource languages to help LLM
         detect language and respond in the same language/dialect.
@@ -1361,132 +1366,62 @@ Instructions:
         if not ENABLE_LANGUAGE_AUTO_DETECTION or not LOW_RESOURCE_LANGUAGE_EXAMPLES:
             return ""
         
-        # K-shot examples for various ASEAN languages/dialects
-        # Examples sourced from k-shot_prompting.md for accurate language identification
-        kshot_library = {
-            'jv': {  # Javanese - examples from k-shot_prompting.md
-                'examples': [
-                    {
-                        'user': 'Aku arep menyang pasar, nanging ora duwe dhuwit.',
-                        'detected_lang': 'Javanese',
-                        'assistant': 'Opo saben dina ketemu kesulitan kaya iki? Dhuwit cilik bisa tuwi disiapake sithik-sithik.'
-                    },
-                    {
-                        'user': 'Aku kerja 12 jam saben dina, piye iki?',
-                        'detected_lang': 'Javanese',
-                        'assistant': 'Kerjo 12 jam saben dina iku kebangeten. Dhawuhe gampang sawise jam 8 sore kae perlu bayaran lebih.'
-                    },
-                    {
-                        'user': 'Aku kerja nganti bengi, gaji ora dibayar.',
-                        'detected_lang': 'Javanese',
-                        'assistant': 'Ora dibayar iku kalangar. Kowe perlu catat jam kerjo karo njaluk bukti gaji, terus lapor Dinas Tenaga Kerja.'
-                    },
-                    {
-                        'user': 'Aku durung mangan, opo kowe wis?',
-                        'detected_lang': 'Javanese',
-                        'assistant': 'Durung, mangan bareng? Sakmene luwih enak ora sendirian.'
-                    }
-                ]
-            },
-            'id': {  # Indonesian - examples from k-shot_prompting.md
-                'examples': [
-                    {
-                        'user': 'Saya akan pergi ke pasar besok untuk membeli sayuran.',
-                        'detected_lang': 'Indonesian',
-                        'assistant': 'Bagus! Pergi ke pasar pagi lebih baik untuk mendapat sayuran segar. Jangan lupa bawa tas belanja.'
-                    },
-                    {
-                        'user': 'Saya bekerja 12 jam setiap hari, tapi gaji lembur tidak dibayar.',
-                        'detected_lang': 'Indonesian',
-                        'assistant': 'Itu tidak adil. Lembur harus dibayar lebih penghasilan. Catat jam kerja Anda, kumpulkan bukti, lalu laporkan ke Kementerian Ketenagakerjaan.'
-                    },
-                    {
-                        'user': 'Saya tidak bisa hadir hari ini karena sakit.',
-                        'detected_lang': 'Indonesian',
-                        'assistant': 'Semoga cepat sehat! Hubungi atasan atau HRD untuk memberitahu izin sakit Anda.'
-                    }
-                ]
-            },
-            'ms': {  # Malay - examples from k-shot_prompting.md
-                'examples': [
-                    {
-                        'user': 'Saya ingin membeli tiket bas ke Kuala Lumpur.',
-                        'detected_lang': 'Malay',
-                        'assistant': 'Anda boleh membeli tiket di stesen bas atau laman web syarikat bas. Ambil IC atau pasport untuk bukti.'
-                    },
-                    {
-                        'user': 'Anda boleh pergi ke pejabat Jabatan Tenaga Kerja untuk membuat aduan.',
-                        'detected_lang': 'Malay',
-                        'assistant': 'Ya, itu benar. Bawa dokumen gaji, kontrak kerja, dan bukti jam kerja untuk sokongan aduan anda.'
-                    },
-                    {
-                        'user': 'Bagaimana cara saya memohon bantuan',
-                        'detected_lang': 'Malay',
-                        'assistant': 'Anda boleh memohon melalui pejabat kerajaan berdekatan dengan membawa dokumen yang diperlukan.'
-                    },
-                    {
-                        'user': 'Apa syarat untuk layak',
-                        'detected_lang': 'Malay',
-                        'assistant': 'Syarat utama adalah anda mesti warganegara dan memenuhi kriteria penghasilan yang ditetapkan.'
-                    }
-                ]
-            },
-            'tl': {  # Tagalog
-                'examples': [
-                    {
-                        'user': 'Paano ako makakapag-apply ng tulong',
-                        'detected_lang': 'Tagalog',
-                        'assistant': 'Maaari kang mag-apply sa loob ng tatlong buwan sa pamamagitan ng pagbisita sa opisina ng araw-araw.'
-                    },
-                    {
-                        'user': 'Ano ang mga kinakailangan',
-                        'detected_lang': 'Tagalog',
-                        'assistant': 'Kailangan mo ng ID, certificate of residence, at proof ng kita para sa application.'
-                    }
-                ]
-            },
-            'th': {  # Thai
-                'examples': [
-                    {
-                        'user': 'ฉันจะสมัครสินเชื่อได้อย่างไร',
-                        'detected_lang': 'Thai',
-                        'assistant': 'คุณสามารถสมัครได้ที่สำนักงานท้องถิ่น โดยต้องนำเอกสารประกอบการสมัคร'
-                    },
-                    {
-                        'user': 'ต้องมีเงื่อนไขอะไรบ้าง',
-                        'detected_lang': 'Thai',
-                        'assistant': 'ต้องเป็นสัญชาติไทย มีรายได้ตามที่กำหนด และมีที่อยู่อาศัยถาวร'
-                    }
-                ]
-            },
-            'vi': {  # Vietnamese
-                'examples': [
-                    {
-                        'user': 'Làm cách nào để đăng ký trợ cấp',
-                        'detected_lang': 'Vietnamese',
-                        'assistant': 'Bạn có thể đăng ký tại văn phòng địa phương trong 30 ngày.'
-                    },
-                    {
-                        'user': 'Cần những gì để đủ điều kiện',
-                        'detected_lang': 'Vietnamese',
-                        'assistant': 'Bạn cần CMND, bằng chứng cư trú và bằng chứng thu nhập hợp lệ.'
-                    }
-                ]
-            },
-        }
+        # Centralized k-shot examples are maintained in pipeline/kshot_library.py
+        kshot_library = KSHOT_LIBRARY
         
-        # Build kshot string from configured languages
+        # Build query-aware k-shot string from configured languages
+        query_tokens = {
+            token
+            for token in re.findall(r"[A-Za-zÀ-ÿ0-9']+", (user_query or '').lower())
+            if len(token) > 2
+        }
+
         kshot_parts = []
+        running_chars = 0
         for lang_code in LOW_RESOURCE_LANGUAGE_EXAMPLES:
             lang_code = lang_code.strip().lower()
             if lang_code in kshot_library:
-                kshot_parts.append(f"Language: {lang_code.upper()}")
-                for i, example in enumerate(kshot_library[lang_code]['examples'], 1):
-                    kshot_parts.append(f"  Example {i}:")
-                    kshot_parts.append(f"    Input: \"{example['user']}\"")
+                examples = kshot_library[lang_code]['examples']
+
+                # Rank examples by lexical overlap with the current query.
+                scored_examples = []
+                for idx, example in enumerate(examples):
+                    ex_tokens = {
+                        token
+                        for token in re.findall(r"[A-Za-zÀ-ÿ0-9']+", example['user'].lower())
+                        if len(token) > 2
+                    }
+                    overlap = len(query_tokens & ex_tokens) if query_tokens else 0
+                    scored_examples.append((overlap, idx, example))
+
+                # Highest overlap first, then keep deterministic ordering.
+                scored_examples.sort(key=lambda item: (-item[0], item[1]))
+                selected_examples = [
+                    item[2] for item in scored_examples[:max(1, KSHOT_MAX_EXAMPLES_PER_LANGUAGE)]
+                ]
+
+                language_header = f"Language: {lang_code.upper()}"
+                if running_chars + len(language_header) > KSHOT_MAX_TOTAL_CHARS:
+                    break
+                kshot_parts.append(language_header)
+                running_chars += len(language_header)
+
+                for i, example in enumerate(selected_examples, 1):
+                    lines = [
+                        f"  Example {i}:",
+                        f"    Input: \"{example['user']}\"",
+                    ]
                     if 'detected_lang' in example:
-                        kshot_parts.append(f"    Detected Language: {example['detected_lang']}")
-                    kshot_parts.append(f"    Response: \"{example['assistant']}\"")
+                        lines.append(f"    Detected Language: {example['detected_lang']}")
+                    lines.append(f"    Response: \"{example['assistant']}\"")
+
+                    block = "\n".join(lines)
+                    projected = running_chars + len(block)
+                    if projected > KSHOT_MAX_TOTAL_CHARS:
+                        break
+
+                    kshot_parts.extend(lines)
+                    running_chars = projected
         
         if kshot_parts:
             return "\n\nLanguage-Specific K-Shot Examples (learn to detect and respond in user's language):\n" + "\n".join(kshot_parts)
@@ -1647,7 +1582,7 @@ Labour-rights guidance requirements:
     """
 
         # Build multilingual k-shot examples if auto-detection is enabled
-        multilingual_kshot = self._build_multilingual_kshot_examples()
+        multilingual_kshot = self._build_multilingual_kshot_examples(user_query=user_query)
         
         # Determine if we're using language auto-detection
         language_instruction = ""
@@ -2137,6 +2072,38 @@ Always:
         """
         print(f"✨ Step 6: Post-processing response...")
 
+        def infer_response_language(text: str, fallback_language: str) -> str:
+            """
+            Infer language from response text for consistent follow-up language.
+            This helps when initial detection is noisy (e.g., Ilocano vs Indonesian).
+            """
+            lowered = (text or '').lower()
+
+            # Quick script checks first.
+            for ch in lowered:
+                cp = ord(ch)
+                if 0x0E00 <= cp <= 0x0E7F:
+                    return 'th'
+
+            # Ilocano lexical markers.
+            ilocano_markers = {
+                'iti', 'dagiti', 'wenno', 'ania', 'ti', 'nga', 'awanan',
+                'awan', 'agturong', 'agreklamo', 'masapul', 'aramiden',
+            }
+            # Indonesian and Malay markers to avoid false positives.
+            indonesian_markers = {'anda', 'apakah', 'langkah', 'berikutnya', 'saya', 'tidak'}
+            malay_markers = {'adakah', 'seterusnya', 'anda', 'langkah', 'boleh'}
+
+            tokens = set(re.findall(r"[a-zA-Z']+", lowered))
+            ilo_hits = len(tokens & ilocano_markers)
+            id_hits = len(tokens & indonesian_markers)
+            ms_hits = len(tokens & malay_markers)
+
+            if ilo_hits >= 2 and ilo_hits > id_hits and ilo_hits > ms_hits:
+                return 'ilo'
+
+            return fallback_language
+
         def normalize_narrative_text(text: str) -> str:
             """Convert list-like output into paragraph-style narrative text."""
             lines = text.strip().split('\n')
@@ -2244,6 +2211,9 @@ Always:
                     "If online forms are difficult, visit the nearest government service counter for walk-in help."
                 )
 
+        # Align follow-up language with the actual generated answer language.
+        resolved_language = infer_response_language(answer_text, language)
+
         # Language-specific follow-up questions (avoid asking if already a question at the end)
         self._should_add_followup = False
         if FORCE_FOLLOW_UP_QUESTION and '[STEP_GATE]' not in answer_text:
@@ -2278,8 +2248,9 @@ Always:
                     'jv': 'Apa kowe perlu bantuan kanggo langkah sabanjure?',
                     'th': 'คุณต้องการความช่วยเหลือสำหรับขั้นตอนถัดไปหรือไม่?',
                     'vi': 'Bạn có cần giúp đỡ cho bước tiếp theo không?',
+                    'ilo': 'Kayat mo kadi ti tulong para iti sumaruno a langkah?',
                 }
-                lang_code = language if language in followup_questions else 'en'
+                lang_code = resolved_language if resolved_language in followup_questions else 'en'
                 followup_text = followup_questions[lang_code]
                 answer_text = f"{answer_text.rstrip()}\n\n{followup_text}"
                 self._should_add_followup = True
@@ -2290,7 +2261,7 @@ Always:
         result = {
             'answer': answer_items,
             'answer_text': answer_text,
-            'language': language,
+            'language': resolved_language,
             'timestamp': datetime.now().isoformat(),
             'raw_response': llm_response
         }
@@ -2552,7 +2523,11 @@ Simplified text:
                 final_response['intent'] = 'general'
                 final_response['rag_used'] = False
                 final_response['evidence'] = []
-                final_response['detected_language'] = detected_language
+                final_response['detected_language'] = (
+                    final_response.get('language', detected_language)
+                    if ENABLE_LANGUAGE_AUTO_DETECTION
+                    else detected_language
+                )
                 final_response['user_language_code'] = user_nllb_code
                 final_response['sources'] = []
                 final_response['retrieved_chunks_count'] = 0
@@ -2787,7 +2762,11 @@ Simplified text:
             # Add metadata
             final_response['status'] = 'success'
             final_response['retrieved_chunks_count'] = len(retrieved_chunks)
-            final_response['detected_language'] = detected_language
+            final_response['detected_language'] = (
+                final_response.get('language', detected_language)
+                if ENABLE_LANGUAGE_AUTO_DETECTION
+                else detected_language
+            )
             final_response['user_language_code'] = user_nllb_code
             final_response['query_translated'] = should_translate_query and query_for_retrieval != user_query
             final_response['answer_translated'] = self.translation_enabled and self._needs_translation(user_nllb_code)
