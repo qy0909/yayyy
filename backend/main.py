@@ -3,7 +3,6 @@ FastAPI Server for Multilingual RAG Bot
 ========================================
 Exposes RAG pipeline as REST API for Next.js frontend
 """
-
 import sys
 import io
 import os
@@ -17,6 +16,7 @@ if sys.platform == 'win32':
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from typing import Optional, List, Dict, Any
 import uvicorn
@@ -29,6 +29,13 @@ try:
 except Exception as whisper_error:
     whisper = None
     WHISPER_IMPORT_ERROR = whisper_error
+
+try:
+    import edge_tts
+    EDGE_TTS_AVAILABLE = True
+except ImportError:
+    EDGE_TTS_AVAILABLE = False
+    print("⚠️ edge-tts not installed. Highly human-like voice features will fail. Run: pip install edge-tts")
 
 # Load environment variables
 load_dotenv()
@@ -478,6 +485,56 @@ async def simplify(request: SimplifyRequest):
             "error": str(e)
         }
 
+
+@app.get("/api/tts")
+async def text_to_speech(text: str, lang: Optional[str] = None):
+    """
+    Generate highly human-like TTS using Microsoft Edge Neural voices.
+    """
+    if not EDGE_TTS_AVAILABLE:
+        raise HTTPException(status_code=500, detail="edge-tts package is not installed. Run: pip install edge-tts")
+        
+    # Detect the actual language of the text to prevent mismatched accents
+    try:
+        from langdetect import detect
+        base_lang = detect(text).split('-')[0]
+        
+        # Fix Malay vs Indonesian confusion: 
+        # If it's detected as either, trust the 'lang' parameter from the frontend, 
+        # or default to 'ms' (Malay) to prevent Indonesian voice for Malay text.
+        if base_lang in ['id', 'ms']:
+            hint = (lang or '').lower().split('-')[0]
+            base_lang = hint if hint in ['ms', 'id'] else 'ms'
+    except Exception:
+        # Fallback to provided lang or English if detection fails
+        base_lang = (lang or 'en').lower().split('-')[0]
+
+    # Select best neural voices for ASEAN languages
+    voice_map = {
+        'en': 'en-US-AriaNeural',
+        'ms': 'ms-MY-OsmanNeural',
+        'zh': 'zh-CN-XiaoxiaoNeural',
+        'ta': 'ta-IN-PallaviNeural',
+        'th': 'th-TH-PremwadeeNeural',
+        'vi': 'vi-VN-HoaiMyNeural',
+        'tl': 'fil-PH-BlessicaNeural',
+        'id': 'id-ID-GadisNeural'
+    }
+    
+    # Default to English if language code not found
+    voice = voice_map.get(base_lang, 'en-US-AriaNeural')
+    
+    try:
+        async def audio_stream():
+            communicate = edge_tts.Communicate(text, voice)
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    yield chunk["data"]
+            
+        return StreamingResponse(audio_stream(), media_type="audio/mpeg")
+    except Exception as e:
+        print(f"❌ TTS Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/supported-languages")
 async def supported_languages():

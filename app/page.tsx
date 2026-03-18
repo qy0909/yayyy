@@ -93,7 +93,7 @@ export default function InclusiveApp() {
   const [language, setLanguage] = useState("ms-MY");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isListening, setIsListening] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [speakingIndex, setSpeakingIndex] = useState<number | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
   const [showDebugPanel, setShowDebugPanel] = useState(false);
@@ -105,11 +105,22 @@ export default function InclusiveApp() {
   const [previewSourceUrl, setPreviewSourceUrl] = useState<string | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const [isTranscribing, setIsTranscribing] = useState(false);
-  const [warmupStatus, setWarmupStatus] = useState<'checking' | 'warming' | 'ready' | 'failed'>('checking');
+  const [currentAudio, setCurrentAudio] = useState<HTMLAudioElement | null>(null);
 
   const syncLocalMessages = (nextMessages: ChatMessage[]) => {
     setMessages(nextMessages);
     localStorage.setItem(CHAT_HISTORY_STORAGE_KEY, JSON.stringify(nextMessages));
+  };
+
+  const stopAudio = () => {
+    setCurrentAudio((prevAudio) => {
+      if (prevAudio) {
+        prevAudio.pause();
+      }
+      return null;
+    });
+    setSpeakingIndex(null);
+    window.speechSynthesis.cancel();
   };
 
   const refreshConversations = async () => {
@@ -131,6 +142,8 @@ export default function InclusiveApp() {
   };
 
   const loadConversation = async (conversationId: string) => {
+    stopAudio();
+    
     const response = await fetch(`/api/conversations/${conversationId}`, { cache: 'no-store' });
     const result = await response.json();
     if (!response.ok) {
@@ -153,6 +166,8 @@ export default function InclusiveApp() {
   };
 
   const createConversation = async () => {
+    stopAudio();
+    
     try {
       const response = await fetch('/api/conversations', {
         method: 'POST',
@@ -547,7 +562,7 @@ export default function InclusiveApp() {
             <PlusCircle size={18}/> New Session
           </button>
 
-          <div className="flex-1 overflow-y-auto">
+          <div className="flex-1 overflow-y-auto pr-2 -mr-2 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-slate-300 [&::-webkit-scrollbar-thumb]:rounded-full hover:[&::-webkit-scrollbar-thumb]:bg-slate-400">
             <p className="text-[11px] font-bold text-slate-400 uppercase tracking-[0.15em] mb-4">Recent Conversations</p>
             <div className="space-y-3">
               {conversations.map((conversation) => (
@@ -825,28 +840,55 @@ export default function InclusiveApp() {
                     <div className="flex flex-wrap gap-3">
                       <button 
                         onClick={() => {
-                          if (isSpeaking) {
+                          if (speakingIndex === i) {
+                            if (currentAudio) {
+                              currentAudio.pause();
+                              setCurrentAudio(null);
+                            }
                             window.speechSynthesis.cancel();
-                            setIsSpeaking(false);
+                            setSpeakingIndex(null);
                           } else {
+                            if (currentAudio) {
+                              currentAudio.pause();
+                            }
                             window.speechSynthesis.cancel(); // Clear queue
-                            const utterance = new SpeechSynthesisUtterance(m.text);
-                            utterance.lang = language;
+                            setSpeakingIndex(i);
                             
-                            utterance.onstart = () => setIsSpeaking(true);
-                            utterance.onend = () => setIsSpeaking(false);
-                            utterance.onerror = () => setIsSpeaking(false);
-
-                            window.speechSynthesis.speak(utterance);
+                            const ttsLang = m.detectedLanguage || language.split('-')[0] || 'en';
+                            const url = `http://localhost:8000/api/tts?text=${encodeURIComponent(m.text)}&lang=${ttsLang}`;
+                            
+                            const audio = new Audio(url);
+                            setCurrentAudio(audio);
+                            
+                            audio.onplay = () => setSpeakingIndex(i);
+                            audio.onended = () => {
+                              setSpeakingIndex(null);
+                              setCurrentAudio(null);
+                            };
+                            audio.onerror = () => {
+                              console.warn("Neural TTS failed, falling back to browser TTS.");
+                              const utterance = new SpeechSynthesisUtterance(m.text);
+                              utterance.lang = m.detectedLanguage || 'en';
+                              utterance.onstart = () => setSpeakingIndex(i);
+                              utterance.onend = () => { setSpeakingIndex(null); setCurrentAudio(null); };
+                              utterance.onerror = () => { setSpeakingIndex(null); setCurrentAudio(null); };
+                              window.speechSynthesis.speak(utterance);
+                            };
+                            
+                            audio.play().catch(e => {
+                              console.error("Audio playback blocked", e);
+                              setSpeakingIndex(null);
+                              setCurrentAudio(null);
+                            });
                           }
                         }} 
                         className={`flex items-center gap-2 px-5 py-2.5 rounded-full text-sm font-bold transition-all shadow-sm border ${
-                          isSpeaking 
+                          speakingIndex === i 
                             ? 'bg-rose-50 border-rose-200 text-rose-700 hover:bg-rose-100' 
                             : 'bg-white border-slate-200 text-slate-700 hover:border-emerald-500 hover:text-emerald-700'
                         }`}
                       >
-                        {isSpeaking ? (
+                        {speakingIndex === i ? (
                           <>
                             <div className="flex gap-1 items-center mr-1">
                               <span className="w-1 h-3 bg-rose-500 animate-pulse"></span>
