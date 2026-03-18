@@ -177,6 +177,9 @@ TOP_K_RESULTS = int(os.getenv('TOP_K_RESULTS', '3'))
 # Supabase table name for embeddings
 EMBEDDINGS_TABLE_NAME = 'embeddings'
 
+# Supabase table name for labour office directory lookup
+LABOUR_OFFICES_TABLE_NAME = os.getenv('LABOUR_OFFICES_TABLE_NAME', 'labour_offices')
+
 # Similarity threshold (0-1, higher = more strict)
 SIMILARITY_THRESHOLD = 0.15
 
@@ -1098,6 +1101,192 @@ class RAGPipeline:
         ]
         lowered = (user_query or '').lower()
         return any(re.search(p, lowered) for p in CONFIRM_PATTERNS)
+
+    def _detect_labour_office_followup_confirmation(
+        self,
+        user_query: str,
+        conversation_history: Optional[List[Dict[str, str]]]
+    ) -> bool:
+        """
+        Return True when the user confirms a previous assistant offer to find
+        labour office contact/location details.
+        """
+        if not conversation_history:
+            return False
+
+        # Find latest assistant turn.
+        last_assistant = ''
+        for turn in reversed(conversation_history):
+            if (turn.get('role') or '').lower() == 'assistant':
+                last_assistant = (turn.get('text') or '').lower()
+                break
+
+        if not last_assistant:
+            return False
+
+        office_question_markers = [
+            'labour office', 'labor office', 'nearest labour office',
+            'closest labour office', 'office in your city',
+            'contact details for the office', 'find the closest office',
+            'pejabat buruh', 'jabatan tenaga kerja',
+        ]
+        asked_about_office = any(marker in last_assistant for marker in office_question_markers)
+        if not asked_about_office:
+            return False
+
+        confirmation_patterns = [
+            r'^(yes|yeah|yep|ya|sure|ok|okay|please|go ahead|continue|proceed)\b',
+            r'^(boleh|ya|ok|teruskan|sila|lanjut|iya)\b',
+        ]
+        lowered_query = (user_query or '').strip().lower()
+        return any(re.search(pattern, lowered_query) for pattern in confirmation_patterns)
+
+    def _should_lookup_labour_office(
+        self,
+        user_query: str,
+        conversation_history: Optional[List[Dict[str, str]]]
+    ) -> bool:
+        """Determine whether this turn should fetch labour office contacts."""
+        lowered = (user_query or '').lower()
+        direct_lookup_markers = [
+            'labour office', 'labor office', 'jabatan tenaga kerja', 'pejabat buruh',
+            'closest office', 'nearest office', 'office contact', 'contact details',
+            'alamat pejabat', 'nombor pejabat', 'find office', 'where is the office',
+        ]
+        if any(marker in lowered for marker in direct_lookup_markers):
+            return True
+
+        return self._detect_labour_office_followup_confirmation(user_query, conversation_history)
+
+    def _extract_location_hint(
+        self,
+        user_query: str,
+        conversation_history: Optional[List[Dict[str, str]]]
+    ) -> Optional[str]:
+        """
+        Extract a likely city/region from current query and recent user turns.
+        """
+        text_pool = [user_query or '']
+        for turn in (conversation_history or [])[-6:]:
+            if (turn.get('role') or '').lower() == 'user':
+                text_pool.append(turn.get('text') or '')
+
+        merged = ' '.join(text_pool).lower()
+
+        location_aliases = {
+            'kuala lumpur': 'kuala lumpur',
+            'kl': 'kuala lumpur',
+            'selangor': 'selangor',
+            'shah alam': 'shah alam',
+            'johor': 'johor',
+            'johor bahru': 'johor bahru',
+            'penang': 'penang',
+            'pulau pinang': 'penang',
+            'perak': 'perak',
+            'ipoh': 'ipoh',
+            'kedah': 'kedah',
+            'melaka': 'melaka',
+            'negeri sembilan': 'negeri sembilan',
+            'pahang': 'pahang',
+            'terengganu': 'terengganu',
+            'kelantan': 'kelantan',
+            'perlis': 'perlis',
+            'sabah': 'sabah',
+            'sarawak': 'sarawak',
+            'putrajaya': 'putrajaya',
+        }
+
+        for alias, canonical in location_aliases.items():
+            if re.search(rf'\b{re.escape(alias)}\b', merged):
+                return canonical
+
+        return None
+
+    def lookup_labour_offices(self, location_hint: Optional[str] = None, limit: int = 3) -> List[Dict[str, Any]]:
+        """
+        Lookup labour offices from Supabase table.
+
+        Strategy:
+        - If location is known, search city/state/region fields with case-insensitive match.
+        - If no location is found, return national offices first.
+        """
+        try:
+            table = self.supabase_client.table(LABOUR_OFFICES_TABLE_NAME)
+
+            if location_hint:
+                # 1) Exact-ish location match across common location columns.
+                location = location_hint.strip()
+                query = (
+                    table
+                    .select('*')
+                    .eq('is_active', True)
+                    .or_(
+                        f"city.ilike.%{location}%,state_region.ilike.%{location}%,"
+                        f"district.ilike.%{location}%,country_code.ilike.%{location}%"
+                    )
+                    .limit(limit)
+                )
+                response = query.execute()
+                data = response.data or []
+                if data:
+                    return data
+
+            # 2) Fallback: national helpline/office entries.
+            response = (
+                table
+                .select('*')
+                .eq('is_active', True)
+                .eq('is_national', True)
+                .limit(limit)
+                .execute()
+            )
+            data = response.data or []
+            if data:
+                return data
+
+            # 3) Last fallback: any active offices.
+            response = (
+                table
+                .select('*')
+                .eq('is_active', True)
+                .limit(limit)
+                .execute()
+            )
+            return response.data or []
+        except Exception as error:
+            self._log_debug(f"[Office Lookup] ⚠️ Failed lookup from '{LABOUR_OFFICES_TABLE_NAME}': {error}")
+            return []
+
+    def _format_office_chunk(self, office: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert labour office row into RAG chunk format."""
+        name = office.get('office_name', 'Labour Office')
+        city = office.get('city', '')
+        state_region = office.get('state_region', '')
+        address = office.get('address', 'Address not available')
+        phone = office.get('phone', 'Phone not available')
+        email = office.get('email', 'Email not available')
+        website = office.get('website', '')
+        open_hours = office.get('open_hours', 'Opening hours not available')
+        country_code = office.get('country_code', 'MY')
+
+        location_label = ', '.join([part for part in [city, state_region] if part]).strip(', ')
+        if not location_label:
+            location_label = country_code
+
+        content = (
+            f"Official labour office contact for {location_label}: {name}. "
+            f"Address: {address}. Phone: {phone}. Email: {email}. "
+            f"Opening hours: {open_hours}."
+        )
+
+        return {
+            'title': f"Labour Office Directory: {name}",
+            'content': content,
+            'source_url': website,
+            'url': website,
+            'language': 'en',
+            'similarity': 1.0,
+        }
 
     def _prepare_general_prompt(
         self,
@@ -2281,6 +2470,12 @@ Simplified text:
                 intent = 'task_or_policy'
                 self._log_debug("[Step 0] 🔄 Step-gate confirmation detected — overriding intent to task_or_policy")
 
+            # Override: if user confirms office-finding follow-up (e.g., "yes"),
+            # run full pipeline so we can fetch actual labour office contacts.
+            if intent == 'general' and self._detect_labour_office_followup_confirmation(user_query, conversation_history):
+                intent = 'task_or_policy'
+                self._log_debug("[Step 0] 🔄 Labour-office follow-up confirmation detected — overriding intent to task_or_policy")
+
             # Step 1: Detect language/dialect
             self._log_debug("[Step 1] 🔍 Detecting language...")
             
@@ -2445,6 +2640,23 @@ Simplified text:
             # Step 3: Vector search
             self._log_debug("[Step 3] 🔎 Searching vector database...")
             retrieved_chunks = self.vector_search(query_embedding)
+
+            # Optional augmentation: if user asks to find nearest labour office (or confirms "yes"
+            # to that question), fetch directory contacts from Supabase and prepend them.
+            if self._should_lookup_labour_office(user_query, conversation_history):
+                location_hint = self._extract_location_hint(user_query, conversation_history)
+                if location_hint:
+                    self._log_debug(f"[Step 3] 📍 Labour office lookup enabled (location hint: {location_hint})")
+                else:
+                    self._log_debug("[Step 3] 📍 Labour office lookup enabled (no location hint; using national fallback)")
+
+                office_rows = self.lookup_labour_offices(location_hint=location_hint, limit=3)
+                office_chunks = [self._format_office_chunk(row) for row in office_rows]
+                if office_chunks:
+                    retrieved_chunks = office_chunks + (retrieved_chunks or [])
+                    self._log_debug(f"[Step 3] ✓ Added {len(office_chunks)} labour office contact result(s)")
+                else:
+                    self._log_debug("[Step 3] ⚠️ Labour office lookup returned no active entries")
             
             if not retrieved_chunks:
                 self._log_debug("[Step 3] ⚠️ No relevant documents found")
