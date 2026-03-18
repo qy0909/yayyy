@@ -204,6 +204,13 @@ ENABLE_STEP_GATE = os.getenv('ENABLE_STEP_GATE', 'false').lower() in {'1', 'true
 # Reading level for simplification
 READING_LEVEL = '5th-grade'
 
+# Enable LLM to auto-detect and respond in user's language (k-shot prompting)
+ENABLE_LANGUAGE_AUTO_DETECTION = os.getenv('ENABLE_LANGUAGE_AUTO_DETECTION', 'true').lower() in {'1', 'true', 'yes'}
+
+# K-shot examples for low-resource languages/dialects (comma-separated language codes)
+# Examples: 'ms,tl,th,vi' to enable k-shot examples for Malay, Tagalog, Thai, Vietnamese
+LOW_RESOURCE_LANGUAGE_EXAMPLES = os.getenv('LOW_RESOURCE_LANGUAGE_EXAMPLES', 'ms,tl,th').lower().split(',')
+
 # Reduce chunk size before sending retrieved context to the LLM
 CHUNK_SUMMARY_MAX_CHARS = 700 if SPEED_MODE else 900
 CHUNK_SUMMARY_MAX_SENTENCES = 3 if SPEED_MODE else 4
@@ -230,6 +237,13 @@ TRANSLATION_MODEL_NAME = 'facebook/nllb-200-distilled-600M'
 
 # Pivot languages for RAG retrieval (your embeddings are in these languages)
 PIVOT_LANGUAGES = ['eng_Latn', 'zsm_Latn']  # English and Malay
+
+# If enabled, queries in embedding-supported non-pivot languages are sent
+# directly to vector search instead of being translated to pivot first.
+DIRECT_RETRIEVAL_FOR_SUPPORTED_LANGS = os.getenv(
+    'DIRECT_RETRIEVAL_FOR_SUPPORTED_LANGS',
+    'true'
+).lower() in {'1', 'true', 'yes'}
 
 # NLLB Language Code Mapping for ASEAN Countries
 # Format: 'langdetect_code' -> 'nllb_flores_code'
@@ -1071,7 +1085,29 @@ class RAGPipeline:
         conversation_context = '\n'.join(history_lines) if history_lines else 'No prior conversation.'
         summary_text = (conversation_summary or '').strip() or 'No earlier summary.'
 
-        return f"""You are CivicGuide, a warm and helpful public-service assistant.
+        if ENABLE_LANGUAGE_AUTO_DETECTION:
+            return f"""You are CivicGuide, a warm and helpful public-service assistant.
+
+User Message (auto-detected): \"{user_query}\"
+
+Earlier Conversation Summary:
+{summary_text}
+
+Recent Conversation:
+{conversation_context}
+
+Instructions:
+1. Detect the language of the user message automatically.
+2. Respond in the SAME language as the user message.
+3. For greetings or thanks, reply warmly in 1-2 sentences.
+4. If the user seems to have a real question or need, provide one short practical guidance step first, then ask one clarifying question.
+5. Do not invent government policies or procedures.
+6. Keep your reply short (2-4 sentences maximum) and action-oriented.
+7. Do not start with stock phrases like \"Here's a helpful response\" or \"Certainly!\".
+8. If unsure of the detected language, respond in the language that seems most natural for the user's input.
+"""
+        else:
+            return f"""You are CivicGuide, a warm and helpful public-service assistant.
 
 User message (in {target_language}): \"{user_query}\"
 
@@ -1089,6 +1125,150 @@ Instructions:
 5. Keep your reply short (2-4 sentences maximum) and action-oriented.
 6. Do not start with stock phrases like \"Here's a helpful response\" or \"Certainly!\".
 """
+
+    def _build_multilingual_kshot_examples(self) -> str:
+        """
+        Build k-shot examples for low-resource languages to help LLM
+        detect language and respond in the same language/dialect.
+        
+        These examples teach the LLM how to:
+        1. Auto-detect the language from user input
+        2. Respond in the same language
+        3. Handle dialects and low-resource languages
+        """
+        if not ENABLE_LANGUAGE_AUTO_DETECTION or not LOW_RESOURCE_LANGUAGE_EXAMPLES:
+            return ""
+        
+        # K-shot examples for various ASEAN languages/dialects
+        # Examples sourced from k-shot_prompting.md for accurate language identification
+        kshot_library = {
+            'jv': {  # Javanese - examples from k-shot_prompting.md
+                'examples': [
+                    {
+                        'user': 'Aku arep menyang pasar, nanging ora duwe dhuwit.',
+                        'detected_lang': 'Javanese',
+                        'assistant': 'Opo saben dina ketemu kesulitan kaya iki? Dhuwit cilik bisa tuwi disiapake sithik-sithik.'
+                    },
+                    {
+                        'user': 'Aku kerja 12 jam saben dina, piye iki?',
+                        'detected_lang': 'Javanese',
+                        'assistant': 'Kerjo 12 jam saben dina iku kebangeten. Dhawuhe gampang sawise jam 8 sore kae perlu bayaran lebih.'
+                    },
+                    {
+                        'user': 'Aku kerja nganti bengi, gaji ora dibayar.',
+                        'detected_lang': 'Javanese',
+                        'assistant': 'Ora dibayar iku kalangar. Kowe perlu catat jam kerjo karo njaluk bukti gaji, terus lapor Dinas Tenaga Kerja.'
+                    },
+                    {
+                        'user': 'Aku durung mangan, opo kowe wis?',
+                        'detected_lang': 'Javanese',
+                        'assistant': 'Durung, mangan bareng? Sakmene luwih enak ora sendirian.'
+                    }
+                ]
+            },
+            'id': {  # Indonesian - examples from k-shot_prompting.md
+                'examples': [
+                    {
+                        'user': 'Saya akan pergi ke pasar besok untuk membeli sayuran.',
+                        'detected_lang': 'Indonesian',
+                        'assistant': 'Bagus! Pergi ke pasar pagi lebih baik untuk mendapat sayuran segar. Jangan lupa bawa tas belanja.'
+                    },
+                    {
+                        'user': 'Saya bekerja 12 jam setiap hari, tapi gaji lembur tidak dibayar.',
+                        'detected_lang': 'Indonesian',
+                        'assistant': 'Itu tidak adil. Lembur harus dibayar lebih penghasilan. Catat jam kerja Anda, kumpulkan bukti, lalu laporkan ke Kementerian Ketenagakerjaan.'
+                    },
+                    {
+                        'user': 'Saya tidak bisa hadir hari ini karena sakit.',
+                        'detected_lang': 'Indonesian',
+                        'assistant': 'Semoga cepat sehat! Hubungi atasan atau HRD untuk memberitahu izin sakit Anda.'
+                    }
+                ]
+            },
+            'ms': {  # Malay - examples from k-shot_prompting.md
+                'examples': [
+                    {
+                        'user': 'Saya ingin membeli tiket bas ke Kuala Lumpur.',
+                        'detected_lang': 'Malay',
+                        'assistant': 'Anda boleh membeli tiket di stesen bas atau laman web syarikat bas. Ambil IC atau pasport untuk bukti.'
+                    },
+                    {
+                        'user': 'Anda boleh pergi ke pejabat Jabatan Tenaga Kerja untuk membuat aduan.',
+                        'detected_lang': 'Malay',
+                        'assistant': 'Ya, itu benar. Bawa dokumen gaji, kontrak kerja, dan bukti jam kerja untuk sokongan aduan anda.'
+                    },
+                    {
+                        'user': 'Bagaimana cara saya memohon bantuan',
+                        'detected_lang': 'Malay',
+                        'assistant': 'Anda boleh memohon melalui pejabat kerajaan berdekatan dengan membawa dokumen yang diperlukan.'
+                    },
+                    {
+                        'user': 'Apa syarat untuk layak',
+                        'detected_lang': 'Malay',
+                        'assistant': 'Syarat utama adalah anda mesti warganegara dan memenuhi kriteria penghasilan yang ditetapkan.'
+                    }
+                ]
+            },
+            'tl': {  # Tagalog
+                'examples': [
+                    {
+                        'user': 'Paano ako makakapag-apply ng tulong',
+                        'detected_lang': 'Tagalog',
+                        'assistant': 'Maaari kang mag-apply sa loob ng tatlong buwan sa pamamagitan ng pagbisita sa opisina ng araw-araw.'
+                    },
+                    {
+                        'user': 'Ano ang mga kinakailangan',
+                        'detected_lang': 'Tagalog',
+                        'assistant': 'Kailangan mo ng ID, certificate of residence, at proof ng kita para sa application.'
+                    }
+                ]
+            },
+            'th': {  # Thai
+                'examples': [
+                    {
+                        'user': 'ฉันจะสมัครสินเชื่อได้อย่างไร',
+                        'detected_lang': 'Thai',
+                        'assistant': 'คุณสามารถสมัครได้ที่สำนักงานท้องถิ่น โดยต้องนำเอกสารประกอบการสมัคร'
+                    },
+                    {
+                        'user': 'ต้องมีเงื่อนไขอะไรบ้าง',
+                        'detected_lang': 'Thai',
+                        'assistant': 'ต้องเป็นสัญชาติไทย มีรายได้ตามที่กำหนด และมีที่อยู่อาศัยถาวร'
+                    }
+                ]
+            },
+            'vi': {  # Vietnamese
+                'examples': [
+                    {
+                        'user': 'Làm cách nào để đăng ký trợ cấp',
+                        'detected_lang': 'Vietnamese',
+                        'assistant': 'Bạn có thể đăng ký tại văn phòng địa phương trong 30 ngày.'
+                    },
+                    {
+                        'user': 'Cần những gì để đủ điều kiện',
+                        'detected_lang': 'Vietnamese',
+                        'assistant': 'Bạn cần CMND, bằng chứng cư trú và bằng chứng thu nhập hợp lệ.'
+                    }
+                ]
+            },
+        }
+        
+        # Build kshot string from configured languages
+        kshot_parts = []
+        for lang_code in LOW_RESOURCE_LANGUAGE_EXAMPLES:
+            lang_code = lang_code.strip().lower()
+            if lang_code in kshot_library:
+                kshot_parts.append(f"Language: {lang_code.upper()}")
+                for i, example in enumerate(kshot_library[lang_code]['examples'], 1):
+                    kshot_parts.append(f"  Example {i}:")
+                    kshot_parts.append(f"    Input: \"{example['user']}\"")
+                    if 'detected_lang' in example:
+                        kshot_parts.append(f"    Detected Language: {example['detected_lang']}")
+                    kshot_parts.append(f"    Response: \"{example['assistant']}\"")
+        
+        if kshot_parts:
+            return "\n\nLanguage-Specific K-Shot Examples (learn to detect and respond in user's language):\n" + "\n".join(kshot_parts)
+        return ""
 
     def prepare_llm_prompt(
         self, 
@@ -1244,13 +1424,30 @@ Labour-rights guidance requirements:
     Assistant: "Your passport is your personal document and you should keep it with you. [S1] Ask for it back politely and seek help from the Labour Department or a migrant support center if needed. [S2] Do you want a simple script you can use when asking for it back?"
     """
 
+        # Build multilingual k-shot examples if auto-detection is enabled
+        multilingual_kshot = self._build_multilingual_kshot_examples()
+        
+        # Determine if we're using language auto-detection
+        language_instruction = ""
+        if ENABLE_LANGUAGE_AUTO_DETECTION:
+            language_instruction = "User Query (auto-detected): \"" + user_query + "\""
+            language_context = """
+Language Detection & Response Requirements:
+- Detect the language of the user query automatically (it may be in English, Malay, Tagalog, Thai, Vietnamese, or other ASEAN languages).
+- Respond in the SAME language as the detected user input.
+- Reference the multilingual examples to guide your language-specific responses.
+- If you are uncertain about the language, respond in the language that seems most natural based on the user's input."""
+        else:
+            language_instruction = "User Query (in " + target_language + "): \"" + user_query + "\""
+            language_context = f"6. Respond in natural language in {target_language}."
+
         prompt = f"""You are CivicGuide, an inclusive public-service assistant.
 
 Mission:
 - Help every citizen understand and access government support.
 - Reduce information barriers for users with low literacy or limited digital skills.
 
-User Query (in {target_language}): "{user_query}"
+{language_instruction}
 
 Earlier Conversation Summary:
 {summary_text}
@@ -1262,6 +1459,7 @@ Retrieved Official Context:
 {context_text}
 
 {few_shot_examples}
+{multilingual_kshot}
 
 {labor_mode_guardrail}
 
@@ -1271,7 +1469,7 @@ Instructions:
 3. Be respectful, calm, and practical. Avoid legalistic or bureaucratic tone.
 4. If context is incomplete or uncertain, say so clearly and provide the safest next step.
 5. Do not invent eligibility rules, deadlines, required documents, or links.
-6. Respond in natural language in {target_language}.
+{language_context}
 7. Do not include raw source URLs in the answer body because sources are shown separately in the UI.
 8. {response_format}
 9. {list_format_guardrail}
@@ -1458,6 +1656,35 @@ Do not simply repeat document snippets. Synthesize them into one helpful answer.
         else:
             raise ValueError(f"Unknown provider: {provider}")
     
+    def _build_system_message(self) -> str:
+        """
+        Build a dynamic system message that supports language auto-detection.
+        """
+        if ENABLE_LANGUAGE_AUTO_DETECTION:
+            return """You are CivicGuide, an inclusive public-service assistant.
+
+Your key responsibility: Detect the user's language automatically and respond in that same language.
+
+Supported languages: English, Malay, Tagalog, Thai, Vietnamese, Indonesian, and other ASEAN languages.
+
+Always:
+- Detect the input language from context
+- Respond in the same language as the user
+- Be warm, helpful, and respectful
+- Use simple language suitable for low-literacy users
+- Provide practical guidance with clear next steps"""
+        else:
+            return """You are CivicGuide, an inclusive public-service assistant.
+
+Your key responsibility: Help users understand government policies and access support services.
+
+Always:
+- Be warm, helpful, and respectful
+- Use simple language suitable for low-literacy users
+- Provide practical guidance with clear next steps
+- Avoid legalistic or bureaucratic language
+- Respond in the user's language"""
+    
     def _call_groq_llm(self, prompt: str) -> str:
         """Call Groq API (Ultra-fast inference)"""
         print(f"⚡ Step 5: Calling Groq ({GROQ_MODEL})...")
@@ -1477,8 +1704,7 @@ Do not simply repeat document snippets. Synthesize them into one helpful answer.
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a helpful assistant specializing in providing "
-                                   "simplified information to migrant workers in Southeast Asia."
+                        "content": self._build_system_message()
                     },
                     {
                         "role": "user",
@@ -1519,10 +1745,16 @@ Do not simply repeat document snippets. Synthesize them into one helpful answer.
                 raise ValueError(error)
             
             # Format for chat models
-            messages = [{
-                "role": "user",
-                "content": prompt
-            }]
+            messages = [
+                {
+                    "role": "system",
+                    "content": self._build_system_message()
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
             
             self._log_debug(f"[Step 5] 📡 Sending request to HF Inference API...")
             
@@ -1595,8 +1827,7 @@ Do not simply repeat document snippets. Synthesize them into one helpful answer.
                 messages=[
                     {
                         "role": "system", 
-                        "content": "You are a helpful assistant specializing in providing "
-                                   "simplified information to migrant workers."
+                        "content": self._build_system_message()
                     },
                     {
                         "role": "user", 
@@ -1628,8 +1859,9 @@ Do not simply repeat document snippets. Synthesize them into one helpful answer.
         
         try:
             # Format prompt for chat models
+            system_msg = self._build_system_message()
             formatted_prompt = f"""<|system|>
-You are a helpful assistant specializing in providing simplified information to migrant workers in Southeast Asia.
+{system_msg}
 <|user|>
 {prompt}
 <|assistant|>
@@ -2081,11 +2313,25 @@ Simplified text:
                     ),
                 }
             
-            # Step 1.5: Translate query to pivot language if needed
+            # Step 1.5: Choose retrieval language (direct vs pivot translation)
             query_for_retrieval = user_query
             translation_note = None
+            should_translate_query = False
+
+            # Prefer direct retrieval for non-pivot languages when embeddings support them.
+            use_direct_retrieval = (
+                DIRECT_RETRIEVAL_FOR_SUPPORTED_LANGS
+                and embedding_supported
+                and user_nllb_code not in PIVOT_LANGUAGES
+            )
             
-            if self.translation_enabled and self._needs_translation(user_nllb_code):
+            if use_direct_retrieval:
+                self._log_debug(
+                    "[Step 1.5] ✅ Using direct retrieval for embedding-supported "
+                    f"language ({detected_language}/{user_nllb_code})"
+                )
+            elif self.translation_enabled and self._needs_translation(user_nllb_code):
+                should_translate_query = True
                 self._log_debug(f"[Step 1.5] 🌐 Translating query to pivot language...")
                 
                 # Choose pivot language (prefer Malay for ASEAN, English as fallback)
@@ -2245,7 +2491,7 @@ Simplified text:
             final_response['retrieved_chunks_count'] = len(retrieved_chunks)
             final_response['detected_language'] = detected_language
             final_response['user_language_code'] = user_nllb_code
-            final_response['query_translated'] = query_for_retrieval != user_query
+            final_response['query_translated'] = should_translate_query and query_for_retrieval != user_query
             final_response['answer_translated'] = self.translation_enabled and self._needs_translation(user_nllb_code)
             final_response['intent'] = 'task_or_policy'
             final_response['rag_used'] = True
