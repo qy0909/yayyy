@@ -553,6 +553,39 @@ class RAGPipeline:
                     'all_languages': [{'lang': 'en', 'probability': 1.0}],
                     'confidence': 1.0
                 }
+
+            # Lightweight lexical disambiguation for closely related languages
+            # (especially Javanese vs Indonesian/Malay).
+            tokens = set(re.findall(r"[a-zA-Z']+", text_normalized))
+            javanese_markers = {
+                'aku', 'arep', 'piye', 'ora', 'opo', 'kowe', 'nganti',
+                'durung', 'wis', 'saben', 'dina', 'dhuwit', 'bengi',
+            }
+            indonesian_markers = {
+                'saya', 'tidak', 'bagaimana', 'akan', 'lembur', 'gaji', 'kerja',
+            }
+            malay_markers = {
+                'anda', 'boleh', 'pejabat', 'aduan', 'kerajaan', 'syarat',
+            }
+
+            jv_hits = len(tokens & javanese_markers)
+            id_hits = len(tokens & indonesian_markers)
+            ms_hits = len(tokens & malay_markers)
+
+            if jv_hits >= 2 and jv_hits >= id_hits and jv_hits >= ms_hits:
+                print(
+                    "   ✓ Detected Javanese via lexical markers "
+                    f"(jv={jv_hits}, id={id_hits}, ms={ms_hits})"
+                )
+                return {
+                    'primary_language': 'jv',
+                    'all_languages': [
+                        {'lang': 'jv', 'probability': 0.95},
+                        {'lang': 'id', 'probability': 0.04},
+                        {'lang': 'ms', 'probability': 0.01},
+                    ],
+                    'confidence': 0.95
+                }
             
             # Get primary language
             primary_lang = detect(text)
@@ -2248,7 +2281,10 @@ Simplified text:
             # ----------------------------------------------------------------
             if intent == 'general':
                 self._log_debug("[Fast Path] 💬 General query — skipping vector search")
-                target_lang_for_llm = 'zsm_Latn' if user_nllb_code != 'eng_Latn' else 'eng_Latn'
+                if ENABLE_LANGUAGE_AUTO_DETECTION:
+                    target_lang_for_llm = detected_language
+                else:
+                    target_lang_for_llm = 'zsm_Latn' if user_nllb_code != 'eng_Latn' else 'eng_Latn'
                 general_prompt = self._prepare_general_prompt(
                     user_query,
                     target_language=target_lang_for_llm,
@@ -2261,7 +2297,11 @@ Simplified text:
                     user_query=user_query, allow_step_format=False
                 )
                 # Translate back if needed
-                if self.translation_enabled and self._needs_translation(user_nllb_code):
+                if (
+                    self.translation_enabled
+                    and self._needs_translation(user_nllb_code)
+                    and not ENABLE_LANGUAGE_AUTO_DETECTION
+                ):
                     translated_segments = []
                     for segment in final_response['answer']:
                         text_only = segment.lstrip('• -*').strip()
@@ -2423,7 +2463,8 @@ Simplified text:
             prompt = self.prepare_llm_prompt(
                 query_for_retrieval,  # Use translated query
                 retrieved_chunks,
-                'zsm_Latn' if user_nllb_code != 'eng_Latn' else 'eng_Latn',  # Ask LLM for Malay/English first
+                detected_language if ENABLE_LANGUAGE_AUTO_DETECTION
+                else ('zsm_Latn' if user_nllb_code != 'eng_Latn' else 'eng_Latn'),
                 conversation_history=conversation_history,
                 conversation_summary=conversation_summary,
                 use_step_gate=use_step_gate,
@@ -2445,7 +2486,11 @@ Simplified text:
             )
             
             # Step 6.5: Translate answer back to user's dialect
-            if self.translation_enabled and self._needs_translation(user_nllb_code):
+            if (
+                self.translation_enabled
+                and self._needs_translation(user_nllb_code)
+                and not ENABLE_LANGUAGE_AUTO_DETECTION
+            ):
                 self._log_debug(f"[Step 6.5] 🌐 Translating answer back to user's language ({user_nllb_code})...")
                 
                 translated_segments = []
