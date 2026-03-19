@@ -693,7 +693,7 @@ export default function InclusiveApp() {
   };
 
   return (
-    <div className="flex h-screen bg-[#F8FAFC] font-sans text-slate-900 antialiased">
+    <div className="flex h-[100dvh] bg-[#F8FAFC] font-sans text-slate-900 antialiased">
       
       {/* SIDEBAR OVERLAY */}
       {isSidebarOpen && (
@@ -810,7 +810,7 @@ export default function InclusiveApp() {
         >
           {messages.map((m, i) => (
             <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'} animate-in fade-in slide-in-from-bottom-2 duration-300`}>
-              <div className={`relative max-w-[90%] lg:max-w-[70%] p-5 lg:p-7 rounded-[2rem] ${
+              <div className={`relative max-w-[92%] sm:max-w-[85%] lg:max-w-[70%] px-4 py-3 sm:px-5 sm:py-4 lg:px-6 lg:py-4 rounded-[2rem] ${
                 m.role === 'user' 
                 ? 'bg-emerald-600 text-white rounded-br-none shadow-lg shadow-emerald-100' 
                 : 'bg-slate-50 text-slate-800 border border-slate-100 rounded-bl-none'
@@ -819,7 +819,7 @@ export default function InclusiveApp() {
                 {m.role === 'assistant' && (
                   <div className="flex items-center gap-2 mb-3 flex-wrap">
                     {m.ragUsed === true && (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider bg-blue-50 text-blue-600 border border-blue-200">
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider bg-emerald-50 text-emerald-700 border border-emerald-200">
                         <Search size={10} /> RAG Verified
                       </span>
                     )}
@@ -859,7 +859,7 @@ export default function InclusiveApp() {
                               return next;
                             });
                           }}
-                          className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-amber-100 text-amber-800 border border-amber-300 hover:bg-amber-200 hover:text-amber-900 transition-colors shadow-sm"
+                          className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-emerald-50 text-emerald-800 border border-emerald-200 hover:bg-emerald-100 hover:text-emerald-900 transition-colors shadow-sm"
                         >
                           <FileText size={12} />
                           {expandedEvidence.has(i) ? '▾' : '▸'} Original Source Excerpts ({m.evidence.length})
@@ -867,12 +867,12 @@ export default function InclusiveApp() {
                         {expandedEvidence.has(i) && (
                           <div className="space-y-2 mt-2">
                             {m.evidence.map((ev: EvidenceItem, evIdx: number) => (
-                              <div key={evIdx} className="bg-amber-50 border border-amber-200 rounded-xl p-3">
+                              <div key={evIdx} className="bg-white border border-emerald-100 rounded-xl p-3.5 shadow-sm transition-all hover:border-emerald-300 hover:shadow-md">
                                 <div className="flex items-center justify-between mb-1.5">
                                   <button
                                     type="button"
                                     onClick={() => handleCitationJump(i, ev.citation_tag, m.sources as SourceItem[] | undefined)}
-                                    className="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full hover:bg-yellow-200 hover:text-amber-900 transition-colors"
+                                    className="text-[10px] font-bold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded-full hover:bg-emerald-200 hover:text-emerald-900 transition-colors"
                                     title="Jump to reconstructed source chunk"
                                   >
                                     [{ev.citation_tag}]
@@ -892,15 +892,15 @@ export default function InclusiveApp() {
                                 <button
                                   type="button"
                                   onClick={() => handleCitationJump(i, ev.citation_tag, m.sources as SourceItem[] | undefined)}
-                                  className="mt-1.5 text-[10px] text-amber-700 hover:underline"
+                                  className="mt-2 inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-600 hover:text-emerald-800 transition-colors"
                                 >
-                                  Jump to highlighted chunk in preview
+                                  <Search size={10} /> View in Document
                                 </button>
                                 {ev.source_url && (
                                   <button
                                     type="button"
                                     onClick={() => window.open(ev.source_url, '_blank')}
-                                    className="mt-1.5 text-[10px] text-emerald-600 hover:underline flex items-center gap-1"
+                                    className="mt-2 ml-4 inline-flex items-center gap-1 text-[10px] font-semibold text-slate-500 hover:text-emerald-600 transition-colors"
                                   >
                                     <ExternalLink size={10} /> View source
                                   </button>
@@ -914,7 +914,7 @@ export default function InclusiveApp() {
 
                     {/* Legacy single source support */}
                     {m.source && (!m.sources || m.sources.length === 0) && (
-                      <div className="bg-white border border-slate-200 rounded-2xl p-4 flex items-center justify-between group hover:border-emerald-400 transition-all cursor-pointer shadow-sm">
+                      <div className="bg-white border border-emerald-100 rounded-2xl p-4 flex items-center justify-between group hover:border-emerald-300 hover:shadow-md transition-all cursor-pointer shadow-sm">
                         <div className="flex items-center gap-3 overflow-hidden">
                           <div className="p-2.5 bg-emerald-50 text-emerald-600 rounded-xl">
                             <FileText size={20} />
@@ -1089,7 +1089,7 @@ export default function InclusiveApp() {
               {/* MIC BUTTON */}
               <button 
                 onClick={toggleListening}
-                className={`p-4 rounded-full transition-all z-40 ${
+                className={`p-3 sm:p-4 rounded-full transition-all z-40 ${
                   isListening 
                     ? 'bg-rose-500 text-white shadow-lg ring-4 ring-rose-100 scale-105' 
                     : isTranscribing 
@@ -1107,14 +1107,14 @@ export default function InclusiveApp() {
                 onChange={(e) => setInput(e.target.value)} 
                 onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSend())}
                 placeholder={isListening ? "" : "Ask me anything..."} 
-                className={`flex-1 bg-transparent border-none focus:ring-0 text-slate-800 py-4 text-lg resize-none max-h-32 transition-opacity ${isTranscribing ? 'opacity-0' : 'opacity-100'}`}
+                className={`flex-1 bg-transparent border-none focus:ring-0 text-slate-800 py-3 sm:py-4 text-base sm:text-lg resize-none max-h-32 transition-opacity ${isTranscribing ? 'opacity-0' : 'opacity-100'}`}
               />
 
               {/* SEND BUTTON */}
               <button 
                 onClick={() => handleSend()}
                 disabled={!input || isListening || isTranscribing}
-                className={`p-4 rounded-full transition-all z-20 ${
+                className={`p-3 sm:p-4 rounded-full transition-all z-20 ${
                   !input || isListening || isTranscribing 
                     ? 'opacity-0 scale-50 pointer-events-none' 
                     : 'bg-emerald-600 text-white shadow-lg shadow-emerald-200 active:scale-90'
@@ -1137,7 +1137,7 @@ export default function InclusiveApp() {
               onClick={resetPreview}
             />
             <aside className="fixed lg:absolute right-0 top-0 bottom-0 w-full max-w-md lg:max-w-none lg:w-[27rem] bg-white border-l border-slate-200 z-50 lg:z-20 flex flex-col">
-              <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100 bg-slate-50">
+              <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200 bg-slate-50/80 backdrop-blur-md">
                 <div className="min-w-0">
                   <p className="text-xs font-semibold text-slate-700 truncate">
                     {previewData?.source_title || 'Reconstructed document preview'}
@@ -1152,7 +1152,7 @@ export default function InclusiveApp() {
                     <button
                       type="button"
                       onClick={() => window.open(previewData.source_url, '_blank')}
-                      className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-semibold bg-slate-900 text-white hover:bg-emerald-600 transition-colors"
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[10px] font-semibold bg-emerald-50 text-emerald-700 hover:bg-emerald-100 transition-colors border border-emerald-200"
                     >
                       <ExternalLink size={12} />
                       Original
@@ -1210,10 +1210,10 @@ export default function InclusiveApp() {
                         }
                         previewChunkRefs.current[`pos:${chunkPos}`] = el;
                       }}
-                      className={`rounded-xl border px-3 py-2 ${
+                      className={`rounded-xl border px-4 py-3 transition-colors ${
                         isHighlighted
-                          ? 'bg-yellow-50 border-yellow-300 shadow-sm'
-                          : 'bg-slate-50 border-slate-200'
+                          ? 'bg-emerald-50/50 border-emerald-400 shadow-sm ring-1 ring-emerald-100'
+                          : 'bg-white border-slate-200 shadow-sm hover:border-slate-300'
                       }`}
                     >
                       <div className="flex items-center justify-between gap-2 mb-1">
@@ -1237,7 +1237,7 @@ export default function InclusiveApp() {
 
         {/* DEBUG PANEL */}
         {showDebugPanel && (
-          <div className="fixed right-0 top-0 bottom-0 w-96 bg-slate-900 text-slate-100 shadow-2xl z-50 flex flex-col border-l border-slate-700">
+          <div className="fixed right-0 top-0 bottom-0 w-full sm:w-96 bg-slate-900 text-slate-100 shadow-2xl z-50 flex flex-col border-l border-slate-700">
             <div className="p-4 border-b border-slate-700 flex items-center justify-between bg-slate-800">
               <div className="flex items-center gap-2">
                 <Info size={18} className="text-purple-400" />
