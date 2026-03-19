@@ -235,6 +235,13 @@ CHUNK_SUMMARY_MAX_CHARS = 700 if SPEED_MODE else 900
 CHUNK_SUMMARY_MAX_SENTENCES = 3 if SPEED_MODE else 4
 TOTAL_CONTEXT_MAX_CHARS = 2200 if SPEED_MODE else 3200
 
+# Auto summary mode: switch to actionable 3-5 bullets when retrieved context is long/complex.
+AUTO_ACTION_BULLET_SUMMARY = os.getenv('AUTO_ACTION_BULLET_SUMMARY', 'true').lower() in {'1', 'true', 'yes'}
+AUTO_SUMMARY_LONG_CONTEXT_CHARS = int(os.getenv('AUTO_SUMMARY_LONG_CONTEXT_CHARS', '1400'))
+AUTO_SUMMARY_LONG_CHUNK_COUNT = int(os.getenv('AUTO_SUMMARY_LONG_CHUNK_COUNT', '4'))
+AUTO_SUMMARY_COMPLEX_SOURCE_COUNT = int(os.getenv('AUTO_SUMMARY_COMPLEX_SOURCE_COUNT', '3'))
+AUTO_SUMMARY_COMPLEX_CONTEXT_CHARS = int(os.getenv('AUTO_SUMMARY_COMPLEX_CONTEXT_CHARS', '900'))
+
 # Maximum tokens for LLM response
 MAX_TOKENS = 550 if SPEED_MODE else 1000
 
@@ -1103,6 +1110,23 @@ class RAGPipeline:
         lowered_query = (user_query or '').lower()
         return any(keyword in lowered_query for keyword in process_keywords)
 
+    def _is_summary_request(self, user_query: str) -> bool:
+        """Detect explicit user intent to receive a summary output."""
+        lowered_query = (user_query or '').lower().strip()
+        if not lowered_query:
+            return False
+
+        summary_keywords = {
+            'summarize', 'summary', 'tl;dr', 'tldr',
+            'ringkaskan', 'ringkasan', 'rumuskan', 'rumusan',
+            'buat ringkas', 'pendekkan',
+        }
+        if any(keyword in lowered_query for keyword in summary_keywords):
+            return True
+
+        # Support short imperative phrasing such as "in short" / "short version".
+        return bool(re.search(r'\b(in short|short version|briefly)\b', lowered_query))
+
     def classify_query_intent(self, query: str) -> str:
         """
         Classify whether the query needs RAG retrieval or is a general/conversational message.
@@ -1511,6 +1535,9 @@ Instructions:
         conversation_history: Optional[List[Dict[str, str]]] = None,
         conversation_summary: str = "",
         use_step_gate: bool = False,
+        compressed_chunks: Optional[List[Dict[str, Any]]] = None,
+        answer_style_override: Optional[str] = None,
+        recursive_context_summary: str = "",
     ) -> str:
         """
         Prepare the prompt for the LLM with retrieved context
@@ -1526,8 +1553,8 @@ Instructions:
             Formatted prompt string
         """
         print(f"📝 Step 4: Preparing LLM prompt...")
-
-        compressed_chunks = self._compress_retrieved_chunks(user_query, retrieved_chunks)
+        effective_answer_style = (answer_style_override or ANSWER_STYLE).lower()
+        compressed_chunks = compressed_chunks or self._compress_retrieved_chunks(user_query, retrieved_chunks)
         
         # Format retrieved documents with citation tags
         context_docs = []
@@ -1545,6 +1572,12 @@ Instructions:
             )
         
         context_text = "\n".join(context_docs)
+        recursive_summary_text = (recursive_context_summary or '').strip()
+        recursive_summary_section = (
+            f"\nRecursive Context Summary (from recursive condensation):\n{recursive_summary_text}\n"
+            if recursive_summary_text
+            else ""
+        )
         history_lines = []
         for turn in (conversation_history or [])[-6:]:
             role = (turn.get('role') or 'user').strip().lower()
@@ -1566,7 +1599,7 @@ Instructions:
         }
         labor_mode = any(keyword in lowered_query for keyword in labor_keywords)
 
-        if ANSWER_STYLE == 'bullet':
+        if effective_answer_style == 'bullet':
             response_format = (
                 f"Write {NUM_BULLET_POINTS} concise bullet points only. "
                 "Each point must be practical and easy to follow."
@@ -1608,7 +1641,7 @@ Instructions:
                 )
 
         list_format_guardrail = ""
-        if ANSWER_STYLE == 'narrative' and not is_process_question:
+        if effective_answer_style == 'narrative' and not is_process_question:
             list_format_guardrail = (
                 "Do NOT use bullet points, numbered lists, markdown list markers, or list-style formatting. "
                 "Write in short, plain paragraphs suitable for low-literacy users."
@@ -1690,6 +1723,7 @@ Recent Conversation:
 
 Retrieved Official Context:
 {context_text}
+{recursive_summary_section}
 
 {few_shot_examples}
 {multilingual_kshot}
@@ -1711,7 +1745,8 @@ Instructions:
 12. If the user is asking a follow-up question, use the recent conversation to resolve references like "it", "that", or "the deadline" before answering.
 13. When you use information from a source, add an inline citation tag like [S1] or [S2] immediately after the relevant sentence. Use the source numbers provided in the Retrieved Official Context above.
 14. Prefer specific facts from the context (for example, eligibility criteria, timelines, or document names) over generic advice when such facts are available.
-15. Think through the answer internally, but output only the final answer without showing hidden reasoning.
+15. If Recursive Context Summary is provided, use it to stay concise, but verify details against Retrieved Official Context before finalizing.
+16. Think through the answer internally, but output only the final answer without showing hidden reasoning.
 
 Before finalizing, check:
 - Can a 12-year-old understand this answer?
@@ -1723,6 +1758,54 @@ Do not simply repeat document snippets. Synthesize them into one helpful answer.
         
         print(f"   ✓ Prompt prepared ({len(prompt)} characters)")
         return prompt
+
+    def _should_auto_action_bullet_summary(
+        self,
+        user_query: str,
+        retrieved_chunks: List[Dict[str, Any]],
+        compressed_chunks: List[Dict[str, Any]],
+    ) -> bool:
+        """Decide whether response should be forced to 3-5 actionable bullets."""
+        if not AUTO_ACTION_BULLET_SUMMARY:
+            return False
+
+        if not compressed_chunks:
+            return False
+
+        total_context_chars = sum(
+            len((chunk.get('summary') or chunk.get('content') or chunk.get('text') or '').strip())
+            for chunk in compressed_chunks
+        )
+        chunk_count = len(compressed_chunks)
+
+        source_keys = set()
+        for chunk in retrieved_chunks:
+            source_key = (chunk.get('source_url') or chunk.get('url') or chunk.get('title') or '').strip().lower()
+            if source_key:
+                source_keys.add(source_key)
+        source_count = len(source_keys)
+
+        long_context = (
+            total_context_chars >= AUTO_SUMMARY_LONG_CONTEXT_CHARS
+            or chunk_count >= AUTO_SUMMARY_LONG_CHUNK_COUNT
+        )
+        complex_context = (
+            source_count >= AUTO_SUMMARY_COMPLEX_SOURCE_COUNT
+            and total_context_chars >= AUTO_SUMMARY_COMPLEX_CONTEXT_CHARS
+        )
+
+        if long_context or complex_context:
+            self._log_debug(
+                "[Step 4] 🧭 Auto-summary mode ON "
+                f"(chars={total_context_chars}, chunks={chunk_count}, sources={source_count})"
+            )
+            return True
+
+        self._log_debug(
+            "[Step 4] 🧭 Auto-summary mode OFF "
+            f"(chars={total_context_chars}, chunks={chunk_count}, sources={source_count})"
+        )
+        return False
 
     def _compress_retrieved_chunks(
         self,
@@ -2132,6 +2215,7 @@ Always:
         user_query: str = "",
         allow_step_format: bool = False,
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        answer_style_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Format the LLM response for frontend display
@@ -2147,6 +2231,7 @@ Always:
             Formatted response dictionary
         """
         print(f"✨ Step 6: Post-processing response...")
+        effective_answer_style = (answer_style_override or ANSWER_STYLE).lower()
 
         def infer_response_language(text: str, fallback_language: str) -> str:
             """
@@ -2228,14 +2313,20 @@ Always:
         )
         paragraphs = [segment.strip() for segment in re.split(r'\n\s*\n', cleaned_response) if segment.strip()]
 
-        if ANSWER_STYLE == 'bullet':
+        if effective_answer_style == 'bullet':
+            # Normalize inline bullets/numbered lists into line-separated markdown list items.
+            bullet_ready_response = cleaned_response
+            bullet_ready_response = re.sub(r"\s*•\s+", "\n- ", bullet_ready_response)
+            bullet_ready_response = re.sub(r"\s+[-*]\s+", "\n- ", bullet_ready_response)
+            bullet_ready_response = re.sub(r"\s+(\d+[\.)])\s+", r"\n\1 ", bullet_ready_response)
+
             answer_items = []
-            for line in cleaned_response.split('\n'):
+            for line in bullet_ready_response.split('\n'):
                 line = line.strip()
                 if line and (line.startswith('•') or line.startswith('-') or line.startswith('*') or line[0].isdigit()):
                     normalized = line.lstrip('•-*0123456789. ').strip()
                     if normalized:
-                        answer_items.append(f"• {normalized}")
+                        answer_items.append(f"- {normalized}")
             if not answer_items:
                 answer_items = [cleaned_response]
             answer_text = '\n'.join(answer_items)
@@ -2331,7 +2422,7 @@ Always:
                 answer_text = f"{answer_text.rstrip()}\n\n{followup_text}"
                 self._should_add_followup = True
 
-        if ANSWER_STYLE != 'bullet':
+        if effective_answer_style != 'bullet':
             answer_items = [answer_text]
 
         result = {
@@ -2342,7 +2433,7 @@ Always:
             'raw_response': llm_response
         }
         
-        print(f"   ✓ Response formatted for style '{ANSWER_STYLE}'")
+        print(f"   ✓ Response formatted for style '{effective_answer_style}'")
         return result
 
     # ========================================================================
@@ -2624,7 +2715,7 @@ Simplified text:
                     "Please enter your question in Malay or English."
                 )
                 if ANSWER_STYLE == 'bullet':
-                    fallback_msg = f"• {fallback_msg}"
+                    fallback_msg = f"- {fallback_msg}"
                 
                 return {
                     'answer': [fallback_msg],
@@ -2726,7 +2817,7 @@ Simplified text:
                     if trans_result['translation_performed']:
                         translated_text = trans_result['translated_text'].lstrip('• ').strip()
                         if ANSWER_STYLE == 'bullet':
-                            no_results_msg = f"• {translated_text}"
+                            no_results_msg = f"- {translated_text}"
                         else:
                             no_results_msg = translated_text
                 
@@ -2742,6 +2833,31 @@ Simplified text:
             
             self._log_debug(f"[Step 3] ✓ Found {len(retrieved_chunks)} relevant chunks")
 
+            compressed_chunks = self._compress_retrieved_chunks(query_for_retrieval, retrieved_chunks)
+            effective_answer_style = ANSWER_STYLE
+            summary_requested = self._is_summary_request(user_query)
+            if summary_requested:
+                effective_answer_style = 'bullet'
+                self._log_debug("[Step 4] 🧭 User requested summary; forcing bullet summary mode")
+            elif self._should_auto_action_bullet_summary(user_query, retrieved_chunks, compressed_chunks):
+                effective_answer_style = 'bullet'
+            self._log_debug(f"[Step 4] ✍️ Effective response style: {effective_answer_style}")
+
+            recursive_context_summary = ""
+            if effective_answer_style == 'bullet':
+                recursive_source_blocks = []
+                for idx, chunk in enumerate(compressed_chunks, 1):
+                    chunk_text = (chunk.get('summary') or chunk.get('content') or chunk.get('text') or '').strip()
+                    if chunk_text:
+                        recursive_source_blocks.append(f"[S{idx}] {chunk_text}")
+
+                recursive_input_text = "\n\n".join(recursive_source_blocks).strip()
+                if recursive_input_text:
+                    self._log_debug("[Step 4] 🔁 Running recursive summarization for summary-mode response")
+                    recursive_context_summary = self.summarize_document(recursive_input_text, chunk_size=2800)
+                else:
+                    self._log_debug("[Step 4] ⚠️ Skipping recursive summarization (empty context after compression)")
+
             # Build evidence array from retrieved chunks
             evidence = []
             for idx, chunk in enumerate(retrieved_chunks, 1):
@@ -2753,6 +2869,7 @@ Simplified text:
                     'source_name': chunk.get('title', f'Source {idx}'),
                     'source_url': chunk.get('source_url', chunk.get('url', '')),
                     'original_excerpt': original_text[:400],
+                    'rerank_score': chunk.get('rerank_score', None),
                     'similarity': chunk.get('similarity', None),
                 })
 
@@ -2772,6 +2889,9 @@ Simplified text:
                 conversation_history=conversation_history,
                 conversation_summary=conversation_summary,
                 use_step_gate=use_step_gate,
+                compressed_chunks=compressed_chunks,
+                answer_style_override=effective_answer_style,
+                recursive_context_summary=recursive_context_summary,
             )
             self._log_debug(f"[Step 4] ✓ Prompt prepared (length: {len(prompt)})")
             
@@ -2788,6 +2908,7 @@ Simplified text:
                 user_query=user_query,
                 allow_step_format=is_process_question,
                 conversation_history=conversation_history,
+                answer_style_override=effective_answer_style,
             )
             
             # Step 6.5: Translate answer back to user's dialect
@@ -2813,9 +2934,9 @@ Simplified text:
                     else:
                         translated_segments.append(segment)
                 
-                if ANSWER_STYLE == 'bullet':
+                if effective_answer_style == 'bullet':
                     final_response['answer'] = [
-                        segment if segment.startswith('•') else f"• {segment}"
+                        segment if re.match(r"^\s*[-*•]\s+", segment) else f"- {segment.strip()}"
                         for segment in translated_segments
                     ]
                     final_response['answer_text'] = '\n'.join(final_response['answer'])
@@ -2829,7 +2950,7 @@ Simplified text:
                 if not self.translation_enabled and user_nllb_code not in PIVOT_LANGUAGES:
                     # Add note that we're showing in Malay/English
                     note = translation_note or "⚠️ Showing results in Malay/English (translation unavailable)"
-                    if ANSWER_STYLE == 'bullet':
+                    if effective_answer_style == 'bullet':
                         final_response['answer'].insert(0, note)
                         final_response['answer_text'] = '\n'.join(final_response['answer'])
                     else:
@@ -2860,6 +2981,7 @@ Simplified text:
                     'summary': chunk.get('summary') or chunk.get('content') or chunk.get('text', ''),
                     'source_url': chunk.get('source_url') or chunk.get('url', ''),
                     'url': chunk.get('source_url') or chunk.get('url', ''),
+                    'rerank_score': chunk.get('rerank_score'),
                     'similarity': chunk.get('similarity'),
                     'language': chunk.get('language', 'unknown'),
                     'chunk_index': chunk.get('chunk_index'),

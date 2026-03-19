@@ -1,7 +1,7 @@
 "use client";
 import React, { useState, useEffect, useRef } from 'react';
 import { 
-  Mic, Send, Volume2, Languages, HeartPulse, Scale, 
+  Mic, Send, Volume2, HeartPulse, Scale, 
   ShieldCheck, History, Menu, X, PlusCircle, 
   ExternalLink, FileText, Search, Loader2, Info
 } from 'lucide-react';
@@ -13,6 +13,7 @@ type EvidenceItem = {
   source_name: string;
   source_url: string;
   original_excerpt: string;
+  rerank_score?: number | null;
   similarity?: number | null;
 };
 
@@ -22,6 +23,7 @@ type SourceItem = {
   summary?: string;
   source_url?: string;
   url?: string;
+  rerank_score?: number | null;
   similarity?: number | null;
   chunk_index?: number | null;
   total_chunks?: number | null;
@@ -769,11 +771,8 @@ export default function InclusiveApp() {
                 : 'bg-slate-50 text-slate-800 border border-slate-100 rounded-bl-none'
               }`}>
                 
-                {m.role === 'assistant' && m.dialect && (
+                {m.role === 'assistant' && (
                   <div className="flex items-center gap-2 mb-3 flex-wrap">
-                    <div className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-emerald-700">
-                      <Languages size={14} className="opacity-70" /> {m.dialect}
-                    </div>
                     {m.ragUsed === true && (
                       <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider bg-blue-50 text-blue-600 border border-blue-200">
                         <Search size={10} /> RAG Verified
@@ -827,9 +826,9 @@ export default function InclusiveApp() {
                                   </button>
                                   <span className="text-[10px] text-slate-500 font-medium truncate ml-2 flex-1 text-right">
                                     {ev.source_name}
-                                    {ev.similarity != null && (
+                                    {(ev.rerank_score != null || ev.similarity != null) && (
                                       <span className="ml-1 text-emerald-600">
-                                        · {(ev.similarity * 100).toFixed(0)}% match
+                                        · {(((ev.rerank_score ?? ev.similarity) as number) * 100).toFixed(0)}% selection
                                       </span>
                                     )}
                                   </span>
