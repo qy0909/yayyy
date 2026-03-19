@@ -3,7 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { 
   Mic, Send, Volume2, HeartPulse, Scale, 
   ShieldCheck, History, Menu, X, PlusCircle, 
-  ExternalLink, FileText, Search, Loader2, Info, Trash2
+  ExternalLink, FileText, Search, Loader2, Trash2, BookOpen
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -84,6 +84,7 @@ type ChatMessage = {
   status?: string;
   detectedLanguage?: string;
   debugLogs?: string[];
+  queryExpansions?: Array<{ phrase?: string; expansion?: string; dialect?: string; language_code?: string }>;
   originalText?: string;
   isSimplifying?: boolean;
 };
@@ -114,6 +115,43 @@ type BackendHealthPayload = {
     warmup_error?: string | null;
     message?: string;
   };
+};
+
+type SlangSubmissionPayload = {
+  phrase: string;
+  meaning: string;
+  normalized_form?: string;
+  dialect?: string;
+  language_code?: string;
+  region?: string;
+  example_sentence?: string;
+  contributor_note?: string;
+};
+
+type SlangTerm = {
+  id: string;
+  phrase: string;
+  meaning: string;
+  normalized_form?: string | null;
+  dialect?: string | null;
+  language_code?: string | null;
+  region?: string | null;
+  example_sentence?: string | null;
+  contributor_note?: string | null;
+  status: 'pending' | 'approved' | 'rejected';
+  is_active: boolean;
+  vote_count: number;
+  created_at?: string;
+  reviewed_at?: string | null;
+  reviewed_by?: string | null;
+  reviewer_note?: string | null;
+};
+
+type SlangTermsApiResponse = {
+  success?: boolean;
+  terms?: SlangTerm[];
+  error?: string;
+  detail?: string;
 };
 
 const MAX_HISTORY_MESSAGES = 6;
@@ -158,8 +196,7 @@ export default function InclusiveApp() {
   const [speakingIndex, setSpeakingIndex] = useState<number | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
-  const [showDebugPanel, setShowDebugPanel] = useState(false);
-  const [currentDebugLogs, setCurrentDebugLogs] = useState<string[]>([]);
+  const [showDictionaryPanel, setShowDictionaryPanel] = useState(false);
   const [warmupStatus, setWarmupStatus] = useState<'checking' | 'warming' | 'ready' | 'failed'>('checking');
   const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
   const [conversations, setConversations] = useState<ConversationRecord[]>([]);
@@ -175,6 +212,18 @@ export default function InclusiveApp() {
   const [currentAudio, setCurrentAudio] = useState<HTMLAudioElement | null>(null);
   const [showStarterChips, setShowStarterChips] = useState(false);
   const [summaryModeEnabled, setSummaryModeEnabled] = useState(false);
+  const [slangPhrase, setSlangPhrase] = useState('');
+  const [slangMeaning, setSlangMeaning] = useState('');
+  const [slangDialect, setSlangDialect] = useState('');
+  const [slangExample, setSlangExample] = useState('');
+  const [slangSubmitting, setSlangSubmitting] = useState(false);
+  const [slangStatusMessage, setSlangStatusMessage] = useState<string | null>(null);
+  const [slangStatusKind, setSlangStatusKind] = useState<'success' | 'error' | null>(null);
+  const [adminTokenInput, setAdminTokenInput] = useState('');
+  const [pendingTerms, setPendingTerms] = useState<SlangTerm[]>([]);
+  const [pendingLoading, setPendingLoading] = useState(false);
+  const [pendingError, setPendingError] = useState<string | null>(null);
+  const [reviewingId, setReviewingId] = useState<string | null>(null);
   const showPreviewPanel = previewLoading || !!previewError || !!previewData;
 
   const syncLocalMessages = (nextMessages: ChatMessage[]) => {
@@ -297,7 +346,6 @@ export default function InclusiveApp() {
     setCurrentConversationId(result.id);
     localStorage.setItem(CONVERSATION_ID_STORAGE_KEY, result.id);
     syncLocalMessages(nextMessages);
-    setCurrentDebugLogs([]);
     resetPreview();
     return result as ConversationRecord;
   };
@@ -320,7 +368,6 @@ export default function InclusiveApp() {
       localStorage.setItem(CONVERSATION_ID_STORAGE_KEY, result.id);
       syncLocalMessages([getWelcomeMessage()]);
       setShowStarterChips(true);
-      setCurrentDebugLogs([]);
       resetPreview();
       await refreshConversations();
       return result as ConversationRecord;
@@ -330,7 +377,6 @@ export default function InclusiveApp() {
       localStorage.removeItem(CONVERSATION_ID_STORAGE_KEY);
       syncLocalMessages([getWelcomeMessage()]);
       setShowStarterChips(true);
-      setCurrentDebugLogs([]);
       resetPreview();
       return null;
     }
@@ -671,7 +717,8 @@ export default function InclusiveApp() {
           dialect: detectedLanguage,
           detectedLanguage: result.detected_language,
           status: result.success ? 'verified' : 'no_results',
-          debugLogs: result.debug_logs || []
+          debugLogs: result.debug_logs || [],
+          queryExpansions: result.query_expansions || []
         };
 
         const updatedMessages = [...newMessages, assistantMessage];
@@ -681,10 +728,6 @@ export default function InclusiveApp() {
           localStorage.setItem(CONVERSATION_ID_STORAGE_KEY, result.conversation_id);
         }
         
-        // Update debug logs display
-        if (result.debug_logs && result.debug_logs.length > 0) {
-          setCurrentDebugLogs(result.debug_logs);
-        }
         await refreshConversations();
       } else if (result.error) {
         // Actual error with error message
@@ -710,6 +753,119 @@ export default function InclusiveApp() {
         text: "I'm having trouble connecting to the backend. Please ensure both servers are running:\n\n• Python backend: http://localhost:8000\n• Next.js frontend: http://localhost:3001",
         dialect: "Connection Error"
       }]);
+    }
+  };
+
+  const handleSlangSubmit = async () => {
+    const phrase = slangPhrase.trim();
+    const meaning = slangMeaning.trim();
+
+    if (!phrase || !meaning) {
+      setSlangStatusKind('error');
+      setSlangStatusMessage('Please fill in both phrase and meaning.');
+      return;
+    }
+
+    setSlangSubmitting(true);
+    setSlangStatusMessage(null);
+    setSlangStatusKind(null);
+
+    const payload: SlangSubmissionPayload = {
+      phrase,
+      meaning,
+      dialect: slangDialect.trim() || undefined,
+      example_sentence: slangExample.trim() || undefined,
+      language_code: language.split('-')[0] || undefined,
+    };
+
+    try {
+      const response = await fetch('/api/slang-terms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      const result = await response.json();
+      if (!response.ok || !result?.success) {
+        throw new Error(result?.detail || result?.error || 'Failed to submit phrase');
+      }
+
+      setSlangStatusKind('success');
+      setSlangStatusMessage('Thanks! Your phrase was submitted for review.');
+      setSlangPhrase('');
+      setSlangMeaning('');
+      setSlangDialect('');
+      setSlangExample('');
+    } catch (error) {
+      setSlangStatusKind('error');
+      setSlangStatusMessage(error instanceof Error ? error.message : 'Failed to submit phrase');
+    } finally {
+      setSlangSubmitting(false);
+    }
+  };
+
+  const loadPendingTerms = async () => {
+    const token = adminTokenInput.trim();
+    if (!token) {
+      setPendingError('Enter admin token to load pending submissions.');
+      return;
+    }
+
+    setPendingLoading(true);
+    setPendingError(null);
+    try {
+      const response = await fetch('/api/slang-terms?status=pending&limit=100', {
+        headers: {
+          'x-admin-token': token,
+        },
+      });
+      const result = (await response.json()) as SlangTermsApiResponse;
+      if (!response.ok || !result?.success) {
+        throw new Error(result?.detail || result?.error || 'Failed to load pending terms');
+      }
+
+      setPendingTerms(result.terms || []);
+    } catch (error) {
+      setPendingTerms([]);
+      setPendingError(error instanceof Error ? error.message : 'Failed to load pending terms');
+    } finally {
+      setPendingLoading(false);
+    }
+  };
+
+  const reviewTerm = async (submissionId: string, status: 'approved' | 'rejected') => {
+    const token = adminTokenInput.trim();
+    if (!token) {
+      setPendingError('Enter admin token before reviewing.');
+      return;
+    }
+
+    setReviewingId(submissionId);
+    setPendingError(null);
+    try {
+      const response = await fetch(`/api/slang-terms/submissions/${encodeURIComponent(submissionId)}/review`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-admin-token': token,
+        },
+        body: JSON.stringify({
+          status,
+          reviewer_id: 'panel_admin',
+          reviewer_note: status === 'approved' ? 'Approved via admin panel' : 'Rejected via admin panel',
+        }),
+      });
+
+      const result = await response.json();
+      if (!response.ok || !result?.success) {
+        throw new Error(result?.detail || result?.error || 'Failed to review term');
+      }
+
+      setPendingTerms((prev) => prev.filter((item) => item.id !== submissionId));
+    } catch (error) {
+      setPendingError(error instanceof Error ? error.message : 'Failed to review term');
+    } finally {
+      setReviewingId(null);
     }
   };
 
@@ -809,17 +965,17 @@ export default function InclusiveApp() {
                 {warmupStatus === 'failed' ? 'Model warmup failed' : 'Warming up model...'}
               </div>
             )}
-            {/* Debug Panel Toggle */}
+            {/* Inclusive Dictionary Toggle */}
             <button 
-              onClick={() => setShowDebugPanel(!showDebugPanel)}
+              onClick={() => setShowDictionaryPanel(!showDictionaryPanel)}
               className={`px-3 py-2 rounded-xl text-xs font-bold transition-all border ${
-                showDebugPanel 
-                  ? 'bg-purple-100 text-purple-700 border-purple-300' 
-                  : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-purple-50'
+                showDictionaryPanel 
+                  ? 'bg-emerald-100 text-emerald-700 border-emerald-300' 
+                  : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-emerald-50'
               }`}
-              title="Toggle debug panel"
+              title="Open inclusive dictionary"
             >
-              <Info size={16} />
+              <BookOpen size={16} />
             </button>
           </div>
         </header>
@@ -1326,54 +1482,145 @@ export default function InclusiveApp() {
           </>
         )}
 
-        {/* DEBUG PANEL */}
-        {showDebugPanel && (
-          <div className="fixed right-0 top-0 bottom-0 w-96 bg-slate-900 text-slate-100 shadow-2xl z-50 flex flex-col border-l border-slate-700">
-            <div className="p-4 border-b border-slate-700 flex items-center justify-between bg-slate-800">
+        {/* INCLUSIVE DICTIONARY PANEL */}
+        {showDictionaryPanel && (
+          <div className="fixed right-0 top-0 bottom-0 w-full max-w-md bg-white shadow-2xl z-50 flex flex-col border-l border-slate-200">
+            <div className="p-4 border-b border-slate-200 flex items-center justify-between bg-emerald-50">
               <div className="flex items-center gap-2">
-                <Info size={18} className="text-purple-400" />
-                <h3 className="font-bold text-sm">Debug Console</h3>
+                <BookOpen size={18} className="text-emerald-600" />
+                <h3 className="font-bold text-sm text-slate-800">Inclusive Dictionary</h3>
               </div>
               <button 
-                onClick={() => setShowDebugPanel(false)}
-                className="p-2 hover:bg-slate-700 rounded-lg transition"
+                onClick={() => setShowDictionaryPanel(false)}
+                className="p-2 hover:bg-emerald-100 rounded-lg transition text-slate-700"
               >
                 <X size={18} />
               </button>
             </div>
             
-            <div className="flex-1 overflow-y-auto p-4 space-y-2 font-mono text-xs">
-              {currentDebugLogs.length > 0 ? (
-                currentDebugLogs.map((log, idx) => {
-                  // Determine log color based on content
-                  let colorClass = "text-slate-300";
-                  if (log.includes("✅") || log.includes("✓")) colorClass = "text-green-400";
-                  else if (log.includes("❌") || log.includes("Error")) colorClass = "text-red-400";
-                  else if (log.includes("⚠️")) colorClass = "text-yellow-400";
-                  else if (log.includes("🎯") || log.includes("Step")) colorClass = "text-blue-400";
-                  else if (log.includes("===")) colorClass = "text-purple-400";
-                  
-                  return (
-                    <div key={idx} className={`${colorClass} leading-relaxed whitespace-pre-wrap`}>
-                      {log}
-                    </div>
-                  );
-                })
-              ) : (
-                <div className="text-slate-500 text-center py-8">
-                  <Info size={32} className="mx-auto mb-2 opacity-50" />
-                  <p>No debug logs yet.</p>
-                  <p className="text-[10px] mt-1">Send a query to see pipeline execution steps.</p>
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Share local words or slang to help the system understand underrepresented communities better.
+              </p>
+
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">Local Phrase</label>
+                  <input
+                    value={slangPhrase}
+                    onChange={(event) => setSlangPhrase(event.target.value)}
+                    placeholder="Example: kerja part-time jadi cari makan"
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:ring-2 focus:ring-emerald-300"
+                  />
                 </div>
+
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">Meaning (Standard Language)</label>
+                  <input
+                    value={slangMeaning}
+                    onChange={(event) => setSlangMeaning(event.target.value)}
+                    placeholder="Explain clearly in formal Malay or English"
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:ring-2 focus:ring-emerald-300"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">Dialect or Language (Optional)</label>
+                  <input
+                    value={slangDialect}
+                    onChange={(event) => setSlangDialect(event.target.value)}
+                    placeholder="Kelantan Malay, Sabah Malay, Manglish, etc."
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:ring-2 focus:ring-emerald-300"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">Example Sentence (Optional)</label>
+                  <textarea
+                    value={slangExample}
+                    onChange={(event) => setSlangExample(event.target.value)}
+                    placeholder="How this phrase is actually used"
+                    rows={3}
+                    className="w-full resize-none rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:ring-2 focus:ring-emerald-300"
+                  />
+                </div>
+              </div>
+
+              {slangStatusMessage && (
+                <p className={`text-xs ${slangStatusKind === 'success' ? 'text-emerald-700' : 'text-rose-600'}`}>
+                  {slangStatusMessage}
+                </p>
               )}
+
+              <div className="pt-3 border-t border-slate-200">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 mb-2">Admin Review</p>
+
+                <div className="space-y-2 mb-3">
+                  <input
+                    type="password"
+                    value={adminTokenInput}
+                    onChange={(event) => setAdminTokenInput(event.target.value)}
+                    placeholder="Admin token"
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:ring-2 focus:ring-emerald-300"
+                  />
+                  <button
+                    onClick={loadPendingTerms}
+                    disabled={pendingLoading}
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {pendingLoading ? 'Loading pending terms...' : 'Load Pending Terms'}
+                  </button>
+                </div>
+
+                {pendingError && (
+                  <p className="text-xs text-rose-600 mb-2">{pendingError}</p>
+                )}
+
+                <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                  {pendingTerms.length === 0 && !pendingLoading && !pendingError && (
+                    <p className="text-xs text-slate-500">No pending terms loaded.</p>
+                  )}
+
+                  {pendingTerms.map((term) => (
+                    <div key={term.id} className="rounded-lg border border-slate-200 bg-slate-50 p-2.5">
+                      <p className="text-xs font-semibold text-slate-800">{term.phrase}</p>
+                      <p className="text-xs text-slate-600 mt-0.5">{term.meaning}</p>
+                      {term.dialect && (
+                        <p className="text-[11px] text-slate-500 mt-1">Dialect: {term.dialect}</p>
+                      )}
+                      {term.example_sentence && (
+                        <p className="text-[11px] text-slate-500 mt-1">Example: {term.example_sentence}</p>
+                      )}
+
+                      <div className="mt-2 flex gap-2">
+                        <button
+                          onClick={() => reviewTerm(term.id, 'approved')}
+                          disabled={reviewingId === term.id}
+                          className="flex-1 rounded-md bg-emerald-600 px-2 py-1.5 text-[11px] font-semibold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {reviewingId === term.id ? 'Saving...' : 'Approve'}
+                        </button>
+                        <button
+                          onClick={() => reviewTerm(term.id, 'rejected')}
+                          disabled={reviewingId === term.id}
+                          className="flex-1 rounded-md bg-rose-600 px-2 py-1.5 text-[11px] font-semibold text-white hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {reviewingId === term.id ? 'Saving...' : 'Reject'}
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
-            
-            <div className="p-4 border-t border-slate-700 bg-slate-800">
+
+            <div className="p-4 border-t border-slate-200 bg-slate-50">
               <button 
-                onClick={() => setCurrentDebugLogs([])}
-                className="w-full px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-xs font-semibold transition"
+                onClick={handleSlangSubmit}
+                disabled={slangSubmitting}
+                className="w-full px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-60"
               >
-                Clear Logs
+                {slangSubmitting ? 'Submitting...' : 'Submit Phrase'}
               </button>
             </div>
           </div>

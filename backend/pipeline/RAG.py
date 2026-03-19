@@ -12,7 +12,7 @@ This pipeline handles user queries through:
 import os
 import re
 import unicodedata
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import json
 import time
 import threading
@@ -195,6 +195,14 @@ EMBEDDINGS_TABLE_NAME = 'embeddings'
 
 # Supabase table name for labour office directory lookup
 LABOUR_OFFICES_TABLE_NAME = os.getenv('LABOUR_OFFICES_TABLE_NAME', 'labour_offices')
+
+# Supabase table name for community-submitted local phrases/slang.
+SLANG_DICTIONARY_TABLE_NAME = os.getenv('SLANG_DICTIONARY_TABLE', 'community_dictionary')
+
+# Query expansion settings for approved local phrase entries.
+ENABLE_SLANG_QUERY_EXPANSION = os.getenv('ENABLE_SLANG_QUERY_EXPANSION', 'true').lower() in {'1', 'true', 'yes'}
+SLANG_TERMS_CACHE_TTL_SECONDS = int(os.getenv('SLANG_TERMS_CACHE_TTL_SECONDS', '300'))
+SLANG_MAX_TERMS_PER_QUERY = int(os.getenv('SLANG_MAX_TERMS_PER_QUERY', '5'))
 
 # Similarity threshold (0-1, higher = more strict)
 SIMILARITY_THRESHOLD = 0.15
@@ -559,6 +567,9 @@ class RAGPipeline:
         # Initialize Supabase client
         print(f"🗄️  Connecting to Supabase...")
         self.supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        self.slang_terms_cache: List[Dict[str, Any]] = []
+        self.slang_terms_cache_loaded_at = 0.0
+        self.last_query_expansions: List[Dict[str, str]] = []
         print(f"🧠 Active LLM configured: {self._describe_active_llm(provider)}")
         
         print("✅ RAG Pipeline initialized successfully!\n")
@@ -2885,6 +2896,104 @@ Simplified text:
         simplified_text = self.call_llm(prompt)
         self._log_debug(f"[Simplify] ✅ Text simplified.")
         return simplified_text
+
+    def _normalize_phrase_for_match(self, text: str) -> str:
+        normalized = (text or '').lower().strip()
+        normalized = re.sub(r'[^\w\s]', ' ', normalized)
+        normalized = re.sub(r'\s+', ' ', normalized)
+        return normalized
+
+    def _get_approved_slang_terms(self) -> List[Dict[str, Any]]:
+        if not ENABLE_SLANG_QUERY_EXPANSION:
+            return []
+
+        now = time.time()
+        cache_age = now - self.slang_terms_cache_loaded_at
+        if self.slang_terms_cache and cache_age < SLANG_TERMS_CACHE_TTL_SECONDS:
+            return self.slang_terms_cache
+
+        try:
+            response = (
+                self.supabase_client
+                .table(SLANG_DICTIONARY_TABLE_NAME)
+                .select('phrase,normalized_form,meaning,dialect,language_code,is_active,status')
+                .eq('status', 'approved')
+                .eq('is_active', True)
+                .limit(1000)
+                .execute()
+            )
+            rows = response.data or []
+            self.slang_terms_cache = rows
+            self.slang_terms_cache_loaded_at = now
+            return rows
+        except Exception as exc:
+            self._log_debug(
+                f"[Step 1.6] ⚠️ Slang lookup unavailable ({SLANG_DICTIONARY_TABLE_NAME}): {exc}"
+            )
+            self.slang_terms_cache = []
+            self.slang_terms_cache_loaded_at = now
+            return []
+
+    def _expand_query_with_slang(self, query: str) -> Tuple[str, List[Dict[str, str]]]:
+        if not ENABLE_SLANG_QUERY_EXPANSION:
+            return query, []
+
+        normalized_query = self._normalize_phrase_for_match(query)
+        if not normalized_query:
+            return query, []
+
+        approved_terms = self._get_approved_slang_terms()
+        if not approved_terms:
+            return query, []
+
+        expansions: List[Dict[str, str]] = []
+        expansion_terms: List[str] = []
+
+        for row in approved_terms:
+            phrase = str(row.get('phrase') or '').strip()
+            if not phrase:
+                continue
+
+            normalized_phrase = self._normalize_phrase_for_match(phrase)
+            if not normalized_phrase:
+                continue
+
+            # Match complete phrase first to reduce accidental partial hits.
+            phrase_pattern = rf'(^|\s){re.escape(normalized_phrase)}(\s|$)'
+            if not re.search(phrase_pattern, normalized_query):
+                continue
+
+            normalized_form = str(row.get('normalized_form') or '').strip()
+            meaning = str(row.get('meaning') or '').strip()
+            expansion = normalized_form or meaning
+            if not expansion:
+                continue
+
+            expansions.append({
+                'phrase': phrase,
+                'expansion': expansion,
+                'dialect': str(row.get('dialect') or ''),
+                'language_code': str(row.get('language_code') or ''),
+            })
+            expansion_terms.append(expansion)
+
+            if len(expansions) >= SLANG_MAX_TERMS_PER_QUERY:
+                break
+
+        deduped_terms: List[str] = []
+        seen = set()
+        for term in expansion_terms:
+            key = term.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped_terms.append(term)
+
+        if not deduped_terms:
+            return query, []
+
+        expanded_query = f"{query.strip()} {' '.join(deduped_terms)}".strip()
+        return expanded_query, expansions
     
     # ========================================================================
     # STEP 7: MAIN PIPELINE EXECUTION
@@ -2932,6 +3041,7 @@ Simplified text:
         """
         # Clear debug logs for this query
         self.debug_logs = []
+        self.last_query_expansions = []
         
         self._log_debug("\n" + "="*70)
         self._log_debug(f"🎯 Processing Query: '{user_query}'")
@@ -3042,6 +3152,7 @@ Simplified text:
                 final_response['intent'] = 'general'
                 final_response['rag_used'] = False
                 final_response['evidence'] = []
+                final_response['query_expansions'] = self.last_query_expansions
                 final_response['detected_language'] = (
                     final_response.get('language', detected_language)
                     if ENABLE_LANGUAGE_AUTO_DETECTION
@@ -3075,6 +3186,7 @@ Simplified text:
                     'user_language_code': user_nllb_code,
                     'timestamp': datetime.now().isoformat(),
                     'status': 'low_resource_dialect',
+                    'query_expansions': self.last_query_expansions,
                     'debug_logs': self.debug_logs,
                     'translation_note': (
                         "Low-resource dialect: neither embedding model nor NLLB-200 "
@@ -3125,6 +3237,18 @@ Simplified text:
                     # Add disclaimer if translation is needed but disabled
                     if user_nllb_code not in PIVOT_LANGUAGES:
                         translation_note = f"⚠️ Note: Translation unavailable. Showing results in Malay/English."
+
+            # Step 1.6: Expand slang/local phrases using approved community dictionary.
+            expanded_query_for_retrieval, matched_expansions = self._expand_query_with_slang(query_for_retrieval)
+            if matched_expansions:
+                self.last_query_expansions = matched_expansions
+                query_for_retrieval = expanded_query_for_retrieval
+                self._log_debug(
+                    "[Step 1.6] 🧩 Query expanded using community dictionary: "
+                    + ", ".join(f"{item['phrase']}→{item['expansion']}" for item in matched_expansions)
+                )
+            else:
+                self._log_debug("[Step 1.6] ℹ️ No community slang expansions matched")
             
             # Step 2: Create query embedding (from translated query)
             self._log_debug("[Step 2] 📊 Creating query embedding...")
@@ -3187,6 +3311,7 @@ Simplified text:
                     'user_language_code': user_nllb_code,
                     'timestamp': datetime.now().isoformat(),
                     'status': 'no_results',
+                    'query_expansions': self.last_query_expansions,
                     'debug_logs': self.debug_logs,
                     'translation_note': translation_note
                 }
@@ -3388,6 +3513,7 @@ Simplified text:
             final_response['evidence'] = evidence
             final_response['summary_mode'] = summary_mode_active
             final_response['summary_mode_reason'] = summary_mode_reason
+            final_response['query_expansions'] = self.last_query_expansions
 
             citation_source_text = final_response.get('raw_response') or final_response.get('answer_text', '')
             citation_counts = self._extract_used_citation_counts(citation_source_text)
@@ -3474,6 +3600,7 @@ Simplified text:
                 'language': 'en',
                 'timestamp': datetime.now().isoformat(),
                 'status': 'error',
+                'query_expansions': self.last_query_expansions,
                 'debug_logs': self.debug_logs
             }
 
