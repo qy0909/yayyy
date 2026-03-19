@@ -175,6 +175,15 @@ LOCAL_EMBEDDING_STANDBY = os.getenv('LOCAL_EMBEDDING_STANDBY', 'true' if SPEED_M
 # Number of similar documents to retrieve
 TOP_K_RESULTS = int(os.getenv('TOP_K_RESULTS', '3'))
 
+# Pull more than top-k from Supabase, then rerank/filter in Python.
+VECTOR_CANDIDATE_MULTIPLIER = int(os.getenv('VECTOR_CANDIDATE_MULTIPLIER', '4'))
+VECTOR_MIN_CANDIDATES = int(os.getenv('VECTOR_MIN_CANDIDATES', '10'))
+
+# Quality filters to avoid tiny chunks like single-word headings.
+MIN_RETRIEVED_CHUNK_CHARS = int(os.getenv('MIN_RETRIEVED_CHUNK_CHARS', '60'))
+MIN_RETRIEVED_CHUNK_WORDS = int(os.getenv('MIN_RETRIEVED_CHUNK_WORDS', '8'))
+MIN_RETRIEVED_QUERY_OVERLAP = int(os.getenv('MIN_RETRIEVED_QUERY_OVERLAP', '1'))
+
 # Supabase table name for embeddings
 EMBEDDINGS_TABLE_NAME = 'embeddings'
 
@@ -979,7 +988,8 @@ class RAGPipeline:
         Returns:
             List of relevant document chunks with metadata
         """
-        print(f"🔎 Step 3: Searching vector database (top {TOP_K_RESULTS} results)...")
+        candidate_count = max(TOP_K_RESULTS * VECTOR_CANDIDATE_MULTIPLIER, VECTOR_MIN_CANDIDATES)
+        print(f"🔎 Step 3: Searching vector database (top {candidate_count} candidates → rerank to {TOP_K_RESULTS})...")
         
         try:
             # ================================================================
@@ -993,7 +1003,7 @@ class RAGPipeline:
                 'match_documents',  # Your Supabase function name
                 {
                     'query_embedding': query_embedding,
-                    'match_count': TOP_K_RESULTS,
+                    'match_count': candidate_count,
                     'similarity_threshold': SIMILARITY_THRESHOLD
                 }
             ).execute()
@@ -1013,6 +1023,70 @@ class RAGPipeline:
             print(f"   ⚠️  Vector search failed: {e}")
             print(f"   ℹ️  Make sure you have created the 'match_documents' function in Supabase")
             return []
+
+    def _tokenize_terms(self, text: str) -> set:
+        """Tokenize text for light lexical overlap scoring."""
+        return {
+            token
+            for token in re.findall(r"[A-Za-zÀ-ÿ0-9']+", (text or '').lower())
+            if len(token) > 2
+        }
+
+    def _rerank_and_filter_chunks(self, user_query: str, retrieved_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Filter low-information chunks and rerank candidates before top-k selection."""
+        if not retrieved_chunks:
+            return []
+
+        query_terms = self._tokenize_terms(user_query)
+        scored_chunks = []
+        dropped_for_quality = 0
+
+        for chunk in retrieved_chunks:
+            text = (chunk.get('content', chunk.get('text', '')) or '').strip()
+            words = re.findall(r"[A-Za-zÀ-ÿ0-9']+", text)
+            word_count = len(words)
+            char_count = len(text)
+
+            content_terms = self._tokenize_terms(text)
+            overlap = len(query_terms & content_terms)
+
+            # Hard filter for tiny, contextless chunks unless they strongly match the query.
+            if (char_count < MIN_RETRIEVED_CHUNK_CHARS or word_count < MIN_RETRIEVED_CHUNK_WORDS) and overlap < MIN_RETRIEVED_QUERY_OVERLAP:
+                dropped_for_quality += 1
+                continue
+
+            similarity = float(chunk.get('similarity') or 0.0)
+            overlap_score = min(overlap / 4.0, 1.0)
+            length_score = min(char_count / 700.0, 1.0)
+
+            # Blend vector similarity with lexical and information-density signals.
+            rerank_score = (0.55 * similarity) + (0.30 * overlap_score) + (0.15 * length_score)
+
+            enriched = dict(chunk)
+            enriched['rerank_score'] = rerank_score
+            enriched['query_overlap'] = overlap
+            enriched['content_char_count'] = char_count
+            scored_chunks.append(enriched)
+
+        if not scored_chunks:
+            # Fail-safe: if filters were too strict, use original results.
+            return retrieved_chunks[:TOP_K_RESULTS]
+
+        scored_chunks.sort(
+            key=lambda item: (
+                item.get('rerank_score', 0.0),
+                item.get('similarity', 0.0),
+                item.get('content_char_count', 0),
+            ),
+            reverse=True,
+        )
+
+        self._log_debug(
+            f"[Step 3] 🧪 Retrieval rerank: {len(retrieved_chunks)} candidates, "
+            f"dropped {dropped_for_quality} low-information chunks, kept {len(scored_chunks)}"
+        )
+
+        return scored_chunks[:TOP_K_RESULTS]
     
     # ========================================================================
     # STEP 4: LLM PROMPT PREPARATION
@@ -2617,6 +2691,7 @@ Simplified text:
             # Step 3: Vector search
             self._log_debug("[Step 3] 🔎 Searching vector database...")
             retrieved_chunks = self.vector_search(query_embedding)
+            retrieved_chunks = self._rerank_and_filter_chunks(query_for_retrieval, retrieved_chunks)
 
             # Optional augmentation: if user asks to find nearest labour office (or confirms "yes"
             # to that question), fetch directory contacts from Supabase and prepend them.
@@ -2787,6 +2862,14 @@ Simplified text:
                     'url': chunk.get('source_url') or chunk.get('url', ''),
                     'similarity': chunk.get('similarity'),
                     'language': chunk.get('language', 'unknown'),
+                    'chunk_index': chunk.get('chunk_index'),
+                    'total_chunks': chunk.get('total_chunks'),
+                    'page_number': chunk.get('page_number'),
+                    'page_start': chunk.get('page_start'),
+                    'page_end': chunk.get('page_end'),
+                    'section': chunk.get('section'),
+                    'subsection': chunk.get('subsection'),
+                    'source_type': chunk.get('source_type'),
                 }
                 formatted_sources.append(formatted_source)
             final_response['sources'] = formatted_sources if formatted_sources else []

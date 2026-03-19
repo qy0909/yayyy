@@ -16,6 +16,48 @@ type EvidenceItem = {
   similarity?: number | null;
 };
 
+type SourceItem = {
+  title?: string;
+  content?: string;
+  summary?: string;
+  source_url?: string;
+  url?: string;
+  similarity?: number | null;
+  chunk_index?: number | null;
+  total_chunks?: number | null;
+  page_number?: number | null;
+  page_start?: number | null;
+  page_end?: number | null;
+  section?: string | null;
+  subsection?: string | null;
+  source_type?: string | null;
+};
+
+type PreviewChunk = {
+  title?: string;
+  content: string;
+  source_url: string;
+  chunk_index?: number | null;
+  total_chunks?: number | null;
+  page_number?: number | null;
+  page_start?: number | null;
+  page_end?: number | null;
+  section?: string | null;
+  subsection?: string | null;
+  source_type?: string | null;
+};
+
+type SourcePreviewPayload = {
+  source_url: string;
+  source_title?: string;
+  source_type?: string;
+  chunk_count: number;
+  highlight_chunk_index?: number | null;
+  highlight_chunk_position?: number | null;
+  chunks: PreviewChunk[];
+  reconstructed_markdown?: string;
+};
+
 type ChatMessage = {
   role: string;
   text: string;
@@ -103,10 +145,16 @@ export default function InclusiveApp() {
   const [conversations, setConversations] = useState<ConversationRecord[]>([]);
   const [expandedEvidence, setExpandedEvidence] = useState<Set<number>>(new Set());
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [previewSourceUrl, setPreviewSourceUrl] = useState<string | null>(null);
+  const [previewData, setPreviewData] = useState<SourcePreviewPayload | null>(null);
+  const [previewOwnerMessageIndex, setPreviewOwnerMessageIndex] = useState<number | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const previewChunkRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [currentAudio, setCurrentAudio] = useState<HTMLAudioElement | null>(null);
+  const [showStarterChips, setShowStarterChips] = useState(false);
+  const showPreviewPanel = previewLoading || !!previewError || !!previewData;
 
   const syncLocalMessages = (nextMessages: ChatMessage[]) => {
     setMessages(nextMessages);
@@ -122,6 +170,62 @@ export default function InclusiveApp() {
     });
     setSpeakingIndex(null);
     window.speechSynthesis.cancel();
+  };
+
+  const resetPreview = () => {
+    setPreviewData(null);
+    setPreviewOwnerMessageIndex(null);
+    setPreviewLoading(false);
+    setPreviewError(null);
+    previewChunkRefs.current = {};
+  };
+
+  const openReconstructedPreview = async (source: SourceItem, messageIndex: number) => {
+    const sourceUrl = source.source_url || source.url;
+    if (!sourceUrl) return;
+
+    setPreviewLoading(true);
+    setPreviewError(null);
+    setPreviewOwnerMessageIndex(messageIndex);
+
+    try {
+      const params = new URLSearchParams({ source_url: sourceUrl });
+      if (typeof source.chunk_index === 'number') {
+        params.set('highlight_chunk_index', String(source.chunk_index));
+      }
+      if (source.title) {
+        params.set('highlight_title', source.title);
+      }
+
+      const response = await fetch(`/api/source-preview?${params.toString()}`, { cache: 'no-store' });
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result?.error || 'Failed to load reconstructed preview');
+      }
+
+      setPreviewData(result as SourcePreviewPayload);
+    } catch (error) {
+      setPreviewData(null);
+      setPreviewError(error instanceof Error ? error.message : 'Failed to load reconstructed preview');
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const handleCitationJump = async (
+    messageIndex: number,
+    citationTag: string,
+    sources?: SourceItem[]
+  ) => {
+    if (!sources || sources.length === 0) return;
+
+    const match = citationTag.match(/^S(\d+)$/i);
+    if (!match) return;
+
+    const sourceIdx = Number(match[1]) - 1;
+    if (Number.isNaN(sourceIdx) || sourceIdx < 0 || sourceIdx >= sources.length) return;
+
+    await openReconstructedPreview(sources[sourceIdx], messageIndex);
   };
 
   const refreshConversations = async () => {
@@ -144,6 +248,7 @@ export default function InclusiveApp() {
 
   const loadConversation = async (conversationId: string) => {
     stopAudio();
+    setShowStarterChips(false);
     
     const response = await fetch(`/api/conversations/${conversationId}`, { cache: 'no-store' });
     const result = await response.json();
@@ -170,7 +275,7 @@ export default function InclusiveApp() {
     localStorage.setItem(CONVERSATION_ID_STORAGE_KEY, result.id);
     syncLocalMessages(nextMessages);
     setCurrentDebugLogs([]);
-    setPreviewSourceUrl(null);
+    resetPreview();
     return result as ConversationRecord;
   };
 
@@ -191,8 +296,9 @@ export default function InclusiveApp() {
       setCurrentConversationId(result.id);
       localStorage.setItem(CONVERSATION_ID_STORAGE_KEY, result.id);
       syncLocalMessages([getWelcomeMessage()]);
+      setShowStarterChips(true);
       setCurrentDebugLogs([]);
-      setPreviewSourceUrl(null);
+      resetPreview();
       await refreshConversations();
       return result as ConversationRecord;
     } catch (error) {
@@ -200,8 +306,9 @@ export default function InclusiveApp() {
       setCurrentConversationId(null);
       localStorage.removeItem(CONVERSATION_ID_STORAGE_KEY);
       syncLocalMessages([getWelcomeMessage()]);
+      setShowStarterChips(true);
       setCurrentDebugLogs([]);
-      setPreviewSourceUrl(null);
+      resetPreview();
       return null;
     }
   };
@@ -212,6 +319,26 @@ export default function InclusiveApp() {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages, isTyping]);
+
+  useEffect(() => {
+    if (!previewData) return;
+
+    const hasIndex = previewData.highlight_chunk_index != null;
+    const hasPosition = previewData.highlight_chunk_position != null;
+    if (!hasIndex && !hasPosition) return;
+
+    const timer = setTimeout(() => {
+      const targetKey = hasIndex
+        ? `idx:${previewData.highlight_chunk_index as number}`
+        : `pos:${previewData.highlight_chunk_position as number}`;
+      const node = previewChunkRefs.current[targetKey];
+      if (node) {
+        node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }, 120);
+
+    return () => clearTimeout(timer);
+  }, [previewData]);
 
   useEffect(() => {
     let isMounted = true;
@@ -417,6 +544,7 @@ export default function InclusiveApp() {
   const handleSend = async (overrideInput?: string) => {
     const textToSend = overrideInput || input;
     if (!textToSend) return;
+    setShowStarterChips(false);
 
     // Add user message to chat
     const newMessages = [...messages, { role: 'user', text: textToSend }];
@@ -461,14 +589,7 @@ export default function InclusiveApp() {
 
       if (result.answer) {
         // Success or no results (both have answer text)
-        // Format sources from the RAG response
-        const sourceUrl = result.sources && result.sources.length > 0 
-          ? result.sources[0].metadata?.url || result.sources[0].metadata?.source
-          : undefined;
-
-        if (sourceUrl) {
-          setPreviewSourceUrl(sourceUrl);
-        }
+        // Keep preview user-driven (click source card) instead of auto-opening.
 
         // Detect language name from code
         const languageMap: Record<string, string> = {
@@ -487,7 +608,7 @@ export default function InclusiveApp() {
         const assistantMessage = { 
           role: 'assistant', 
           text: result.answer,
-          source: sourceUrl,
+          source: undefined,
           sources: result.sources, // Store all sources
           evidence: result.evidence || [],
           intent: result.intent,
@@ -551,13 +672,7 @@ export default function InclusiveApp() {
       {/* SIDEBAR */}
       <aside className={`fixed inset-y-0 left-0 z-50 w-80 bg-slate-100 border-r border-slate-200 transform transition-transform duration-300 ease-in-out lg:relative lg:translate-x-0 ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}`}>
         <div className="p-6 flex flex-col h-full">
-          <div className="flex justify-between items-center mb-8">
-            <div className="flex items-center gap-2">
-              <div className="bg-emerald-600 p-2 rounded-lg text-white">
-                <ShieldCheck size={24} />
-              </div>
-              <h2 className="font-bold text-slate-800 text-xl tracking-tight">Citizen Portal</h2>
-            </div>
+          <div className="flex justify-end items-center mb-8">
             <button onClick={() => setIsSidebarOpen(false)} className="lg:hidden p-2 text-slate-400 hover:bg-slate-100 rounded-full transition"><X /></button>
           </div>
           
@@ -568,7 +683,7 @@ export default function InclusiveApp() {
             }} 
             className="flex items-center justify-center gap-2 w-full py-3 px-4 mb-6 rounded-xl bg-slate-900 text-white font-semibold hover:bg-slate-800 transition-all shadow-sm active:scale-95"
           >
-            <PlusCircle size={18}/> New Session
+            <PlusCircle size={18}/> New Chat
           </button>
 
           <div className="flex-1 overflow-y-auto pr-2 -mr-2 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-slate-300 [&::-webkit-scrollbar-thumb]:rounded-full hover:[&::-webkit-scrollbar-thumb]:bg-slate-400">
@@ -588,9 +703,6 @@ export default function InclusiveApp() {
                   }`}
                 >
                   <p className="font-semibold text-slate-700 mb-1 line-clamp-2">{conversation.title}</p>
-                  <p className="text-xs opacity-70 line-clamp-2">
-                    {conversation.summary || 'Conversation stored on server'}
-                  </p>
                   <p className="text-[11px] opacity-60 mt-2">{formatConversationTime(conversation.updated_at)}</p>
                 </button>
               ))}
@@ -599,7 +711,7 @@ export default function InclusiveApp() {
         </div>
       </aside>
 
-      <main className="flex-1 flex flex-col min-w-0 bg-white relative">
+      <main className={`flex-1 flex flex-col min-w-0 bg-white relative transition-all duration-300 ${showPreviewPanel ? 'lg:pr-[27rem]' : ''}`}>
         {/* HEADER */}
         <header className="sticky top-0 z-30 p-4 lg:px-8 bg-white/80 backdrop-blur-md border-b border-slate-100 flex justify-between items-center">
           <div className="flex items-center gap-4">
@@ -645,7 +757,10 @@ export default function InclusiveApp() {
         </header>
 
         {/* MESSAGES AREA */}
-        <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 lg:p-10 space-y-8 scroll-smooth">
+        <div
+          ref={scrollRef}
+          className="flex-1 overflow-y-auto p-4 lg:p-10 space-y-8 scroll-smooth transition-all duration-300"
+        >
           {messages.map((m, i) => (
             <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'} animate-in fade-in slide-in-from-bottom-2 duration-300`}>
               <div className={`relative max-w-[90%] lg:max-w-[70%] p-5 lg:p-7 rounded-[2rem] ${
@@ -680,74 +795,6 @@ export default function InclusiveApp() {
 
                 {m.role === 'assistant' && (
                   <div className="mt-6 space-y-4">
-                    {/* Display all sources from RAG - show prominently when RAG was used */}
-                    {(m.sources && m.sources.length > 0) && (
-                      <div className="space-y-2">
-                        <p className="text-xs font-bold text-slate-500 uppercase tracking-wide mb-2">
-                          📚 Sources ({m.sources.length})
-                        </p>
-                        {m.sources.map((source: any, idx: number) => {
-                          // Prefer explicit source_url from Supabase row,
-                          // fall back to other common fields or metadata.
-                          const sourceUrl =
-                            source.source_url ||
-                            source.url ||
-                            source.metadata?.url ||
-                            source.metadata?.source ||
-                            source.metadata?.file_name ||
-                            undefined;
-
-                          const similarity = source.similarity ? `${(source.similarity * 100).toFixed(0)}% match` : '';
-                          
-                          return (
-                            <div 
-                              key={idx}
-                              className="bg-white border border-slate-200 rounded-xl p-3 flex items-start gap-3 group hover:border-emerald-400 transition-all cursor-pointer shadow-sm"
-                              onClick={() => sourceUrl && setPreviewSourceUrl(sourceUrl)}
-                            >
-                              <div className="p-2 bg-emerald-50 text-emerald-600 rounded-lg shrink-0">
-                                <FileText size={16} />
-                              </div>
-                              <div className="flex-1 overflow-hidden">
-                                <p className="text-xs font-bold text-slate-800 line-clamp-1">
-                                  {source.title ||
-                                   source.metadata?.title ||
-                                   source.metadata?.file_name ||
-                                   `Source ${idx + 1}`}
-                                </p>
-                                <p className="text-[10px] text-slate-500 truncate mt-0.5">
-                                  {similarity && (
-                                    <span className="text-emerald-600 font-semibold mr-2">
-                                      {similarity}
-                                    </span>
-                                  )}
-                                  {sourceUrl || 'Government database'}
-                                </p>
-                                {(source.summary || source.content) && (
-                                  <p className="text-[10px] text-slate-400 line-clamp-2 mt-1 italic">
-                                    {(source.summary || source.content).substring(0, 100)}...
-                                  </p>
-                                )}
-                              </div>
-                              {sourceUrl && (
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    window.open(sourceUrl, '_blank');
-                                  }}
-                                  className="p-1 rounded-md text-slate-300 hover:text-emerald-500 hover:bg-emerald-50 transition-colors shrink-0 mt-1"
-                                  title="Open in new window"
-                                >
-                                  <ExternalLink size={14} />
-                                </button>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-
                     {/* Evidence section — original source excerpts with citation tags */}
                     {m.evidence && m.evidence.length > 0 && (
                       <div className="space-y-1">
@@ -760,7 +807,7 @@ export default function InclusiveApp() {
                               return next;
                             });
                           }}
-                          className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-400 hover:text-slate-600 transition-colors"
+                          className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-amber-100 text-amber-800 border border-amber-300 hover:bg-amber-200 hover:text-amber-900 transition-colors shadow-sm"
                         >
                           <FileText size={12} />
                           {expandedEvidence.has(i) ? '▾' : '▸'} Original Source Excerpts ({m.evidence.length})
@@ -770,9 +817,14 @@ export default function InclusiveApp() {
                             {m.evidence.map((ev: EvidenceItem, evIdx: number) => (
                               <div key={evIdx} className="bg-amber-50 border border-amber-200 rounded-xl p-3">
                                 <div className="flex items-center justify-between mb-1.5">
-                                  <span className="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleCitationJump(i, ev.citation_tag, m.sources as SourceItem[] | undefined)}
+                                    className="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full hover:bg-yellow-200 hover:text-amber-900 transition-colors"
+                                    title="Jump to reconstructed source chunk"
+                                  >
                                     [{ev.citation_tag}]
-                                  </span>
+                                  </button>
                                   <span className="text-[10px] text-slate-500 font-medium truncate ml-2 flex-1 text-right">
                                     {ev.source_name}
                                     {ev.similarity != null && (
@@ -785,6 +837,13 @@ export default function InclusiveApp() {
                                 <p className="text-[11px] text-slate-600 italic leading-relaxed line-clamp-4">
                                   &ldquo;{ev.original_excerpt}&rdquo;
                                 </p>
+                                <button
+                                  type="button"
+                                  onClick={() => handleCitationJump(i, ev.citation_tag, m.sources as SourceItem[] | undefined)}
+                                  className="mt-1.5 text-[10px] text-amber-700 hover:underline"
+                                >
+                                  Jump to highlighted chunk in preview
+                                </button>
                                 {ev.source_url && (
                                   <button
                                     type="button"
@@ -798,35 +857,6 @@ export default function InclusiveApp() {
                             ))}
                           </div>
                         )}
-                      </div>
-                    )}
-
-                    {/* Inline document preview window */}
-                    {previewSourceUrl && (
-                      <div className="mt-4">
-                        <p className="text-xs font-bold text-slate-500 uppercase tracking-wide mb-2">
-                          Inline document preview
-                        </p>
-                        <div className="relative h-56 rounded-2xl border border-slate-200 overflow-hidden bg-white shadow-sm">
-                          <iframe
-                            src={previewSourceUrl}
-                            className="w-full h-full border-0"
-                            title="Source document preview"
-                          />
-                          <div className="absolute inset-x-0 bottom-0 flex items-center justify-between px-3 py-2 bg-gradient-to-t from-white/90 via-white/70 to-transparent">
-                            <span className="text-[10px] text-slate-500">
-                              Showing source inside chat
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => window.open(previewSourceUrl, '_blank')}
-                              className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-semibold bg-slate-900 text-white hover:bg-emerald-600 transition-colors"
-                            >
-                              <ExternalLink size={12} />
-                              Full screen
-                            </button>
-                          </div>
-                        </div>
                       </div>
                     )}
 
@@ -960,15 +990,22 @@ export default function InclusiveApp() {
         </div>
 
         {/* INPUT AREA */}
-        <footer className="p-4 lg:p-8 bg-white border-t border-slate-100">
-          <div className="max-w-4xl mx-auto">
-            {/* Quick Suggestions */}
-            <div className="flex gap-2 mb-6 overflow-x-auto no-scrollbar pb-2">
-              <button onClick={() => handleSend("Tell me about medical aid")} className="shrink-0 flex items-center gap-2 bg-slate-50 border border-slate-200 px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 hover:bg-emerald-50 hover:border-emerald-200 transition-colors"><HeartPulse size={16}/> Medical Aid</button>
-              <button onClick={() => handleSend("Welfare application")} className="shrink-0 flex items-center gap-2 bg-slate-50 border border-slate-200 px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 hover:bg-blue-50 hover:border-blue-200 transition-colors"><ShieldCheck size={16}/> Welfare</button>
-              <button onClick={() => handleSend("How to get legal help?")} className="shrink-0 flex items-center gap-2 bg-slate-50 border border-slate-200 px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 hover:bg-amber-50 hover:border-amber-200 transition-colors"><Scale size={16}/> Legal Help</button>
+        <footer className="p-4 lg:p-8 bg-white border-t border-slate-100 transition-all duration-300">
+          {/* Floating Chips Area */}
+          {showStarterChips && (
+            <div className="max-w-4xl mx-auto mb-4">
+              <div className="bg-transparent overflow-x-auto no-scrollbar pb-1">
+                <div className="flex gap-2 w-max pr-1">
+                  <button onClick={() => handleSend("Tell me about medical aid")} className="shrink-0 flex items-center gap-2 bg-white/80 backdrop-blur-sm border border-slate-200 px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 hover:bg-emerald-50 hover:border-emerald-200 transition-colors shadow-sm"><HeartPulse size={16}/> Medical Aid</button>
+                  <button onClick={() => handleSend("Welfare application")} className="shrink-0 flex items-center gap-2 bg-white/80 backdrop-blur-sm border border-slate-200 px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 hover:bg-blue-50 hover:border-blue-200 transition-colors shadow-sm"><ShieldCheck size={16}/> Welfare</button>
+                  <button onClick={() => handleSend("How to get legal help?")} className="shrink-0 flex items-center gap-2 bg-white/80 backdrop-blur-sm border border-slate-200 px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 hover:bg-amber-50 hover:border-amber-200 transition-colors shadow-sm"><Scale size={16}/> Legal Help</button>
+                </div>
+              </div>
             </div>
+          )}
 
+          {/* Chat Input Area */}
+          <div className="max-w-4xl mx-auto">
             <div className="relative flex items-end gap-3 bg-slate-50 border-2 border-slate-200 rounded-[2rem] p-2 focus-within:border-emerald-500 transition-all shadow-inner overflow-hidden min-h-[72px]">
               
               {/* LISTENING OVERLAY */}
@@ -1039,6 +1076,112 @@ export default function InclusiveApp() {
             </p>
           </div>
         </footer>
+
+        {/* RIGHT PREVIEW SIDEBAR */}
+        {showPreviewPanel && (
+          <>
+            <div
+              className="fixed inset-0 bg-slate-900/25 z-40 lg:hidden"
+              onClick={resetPreview}
+            />
+            <aside className="fixed lg:absolute right-0 top-0 bottom-0 w-full max-w-md lg:max-w-none lg:w-[27rem] bg-white border-l border-slate-200 z-50 lg:z-20 flex flex-col">
+              <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100 bg-slate-50">
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold text-slate-700 truncate">
+                    {previewData?.source_title || 'Reconstructed document preview'}
+                  </p>
+                  <p className="text-[10px] text-slate-500">
+                    {previewData?.chunk_count || 0} chunks reconstructed from indexed source
+                    {previewOwnerMessageIndex != null ? ` · From response #${previewOwnerMessageIndex + 1}` : ''}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  {previewData?.source_url && (
+                    <button
+                      type="button"
+                      onClick={() => window.open(previewData.source_url, '_blank')}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-semibold bg-slate-900 text-white hover:bg-emerald-600 transition-colors"
+                    >
+                      <ExternalLink size={12} />
+                      Original
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={resetPreview}
+                    className="p-1.5 rounded-full text-slate-500 hover:text-slate-800 hover:bg-slate-200 transition-colors"
+                    title="Close preview"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
+                {previewLoading && (
+                  <div className="flex items-center gap-2 text-xs text-slate-500">
+                    <Loader2 size={14} className="animate-spin" />
+                    Reconstructing document from chunks...
+                  </div>
+                )}
+
+                {previewError && (
+                  <div className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
+                    {previewError}
+                  </div>
+                )}
+
+                {!previewLoading && !previewError && previewData?.chunks?.map((chunk, chunkPos) => {
+                  const chunkIndex = typeof chunk.chunk_index === 'number' ? chunk.chunk_index : chunkPos;
+                  const isHighlighted =
+                    (
+                      previewData.highlight_chunk_index != null &&
+                      typeof chunk.chunk_index === 'number' &&
+                      chunk.chunk_index === previewData.highlight_chunk_index
+                    ) || (
+                      previewData.highlight_chunk_position != null &&
+                      chunkPos === previewData.highlight_chunk_position
+                    );
+
+                  const pageLabel = chunk.page_number != null
+                    ? `Page ${chunk.page_number}`
+                    : (chunk.page_start != null && chunk.page_end != null
+                        ? `Pages ${chunk.page_start}-${chunk.page_end}`
+                        : 'Page n/a');
+
+                  return (
+                    <div
+                      key={`${chunkIndex}-${chunkPos}`}
+                      ref={(el) => {
+                        if (typeof chunk.chunk_index === 'number') {
+                          previewChunkRefs.current[`idx:${chunk.chunk_index}`] = el;
+                        }
+                        previewChunkRefs.current[`pos:${chunkPos}`] = el;
+                      }}
+                      className={`rounded-xl border px-3 py-2 ${
+                        isHighlighted
+                          ? 'bg-yellow-50 border-yellow-300 shadow-sm'
+                          : 'bg-slate-50 border-slate-200'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2 mb-1">
+                        <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
+                          Chunk {chunkIndex}
+                        </p>
+                        <p className="text-[10px] text-slate-500">{pageLabel}</p>
+                      </div>
+                      <div className="prose prose-sm max-w-none text-slate-700 leading-relaxed">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {chunk.content || ''}
+                        </ReactMarkdown>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </aside>
+          </>
+        )}
 
         {/* DEBUG PANEL */}
         {showDebugPanel && (

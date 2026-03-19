@@ -1,0 +1,30 @@
+# Web Scraping & Data Processing
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+pypdf>=4.0.0
+
+# RAG Pipeline Core
+sentence-transformers>=3.0.0
+langdetect>=1.0.9
+supabase>=2.4.0
+
+# Environment & Config
+python-dotenv>=1.0.0
+
+# NLP & Language Models
+spacy>=3.5.0
+
+# LLM Providers (Optional)
+openai>=1.0.0
+google-generativeai>=0.3.0
+groq>=0.4.0
+huggingface-hub>=0.16.0
+
+# Utilities
+pydantic>=2.0.0
+python-multipart>=0.0.5
+
+# FastAPI (for backend)
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0

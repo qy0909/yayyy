@@ -14,7 +14,7 @@ if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
@@ -437,6 +437,100 @@ async def chat(request: QueryRequest):
             "error": error_message,
             "debug_logs": []
         }
+
+
+@app.get("/api/source-preview")
+async def source_preview(
+    source_url: str = Query(..., description="Exact source URL stored in embeddings.source_url"),
+    highlight_chunk_index: Optional[int] = Query(None, description="Chunk index to highlight in reconstructed preview"),
+    highlight_title: Optional[str] = Query(None, description="Source title/chunk title fallback for highlight resolution"),
+):
+    """Return reconstructed document preview from chunks stored in Supabase.
+
+    This avoids client-side iframe internet rendering by reconstructing text
+    from indexed chunks and letting UI highlight the retrieved chunk.
+    """
+    pipeline = get_rag_pipeline()
+
+    try:
+        response = (
+            pipeline.supabase_client
+            .table('embeddings')
+            .select('title,content,source_url,chunk_index,total_chunks,page_number,page_start,page_end,section,subsection,source_type')
+            .eq('source_url', source_url)
+            .order('chunk_index', desc=False)
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch source chunks: {e}")
+
+    chunks = response.data or []
+    if not chunks:
+        raise HTTPException(status_code=404, detail="No chunks found for source_url")
+
+    def sort_key(item: Dict[str, Any]) -> tuple:
+        idx = item.get('chunk_index')
+        if isinstance(idx, int):
+            return (0, idx)
+        return (1, 10**9)
+
+    chunks = sorted(chunks, key=sort_key)
+
+    resolved_highlight_index = highlight_chunk_index
+    resolved_highlight_position: Optional[int] = None
+
+    if resolved_highlight_index is None and highlight_title:
+        normalized_target = highlight_title.strip().lower()
+        for pos, chunk in enumerate(chunks):
+            chunk_title = (chunk.get('title') or '').strip().lower()
+            if chunk_title and chunk_title == normalized_target:
+                chunk_idx = chunk.get('chunk_index')
+                if isinstance(chunk_idx, int):
+                    resolved_highlight_index = chunk_idx
+                else:
+                    resolved_highlight_position = pos
+                break
+
+    reconstructed_parts = []
+    for position, chunk in enumerate(chunks):
+        idx = chunk.get('chunk_index')
+        content = (chunk.get('content') or '').strip()
+        if not content:
+            continue
+
+        meta_segments = []
+        if chunk.get('page_number') is not None:
+            meta_segments.append(f"Page {chunk.get('page_number')}")
+        elif chunk.get('page_start') is not None and chunk.get('page_end') is not None:
+            meta_segments.append(f"Pages {chunk.get('page_start')}-{chunk.get('page_end')}")
+
+        if idx is not None:
+            meta_segments.append(f"Chunk {idx}")
+        else:
+            meta_segments.append(f"Chunk {position}")
+
+        section = (chunk.get('section') or '').strip()
+        subsection = (chunk.get('subsection') or '').strip()
+        if section:
+            meta_segments.append(section)
+        if subsection and subsection != section:
+            meta_segments.append(subsection)
+
+        heading = " | ".join(meta_segments)
+        reconstructed_parts.append(f"### {heading}\n\n{content}")
+
+    reconstructed_markdown = "\n\n---\n\n".join(reconstructed_parts)
+
+    return {
+        "source_url": source_url,
+        "source_title": chunks[0].get('title') or 'Document',
+        "source_type": chunks[0].get('source_type') or 'unknown',
+        "chunk_count": len(chunks),
+        "highlight_chunk_index": resolved_highlight_index,
+        "highlight_chunk_position": resolved_highlight_position,
+        "chunks": chunks,
+        "reconstructed_markdown": reconstructed_markdown,
+    }
 
 
 @app.get("/api/conversations", response_model=ConversationListResponse)
