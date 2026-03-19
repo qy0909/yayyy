@@ -187,6 +187,8 @@ class QueryResponse(BaseModel):
     evidence: List[Dict[str, Any]] = []
     intent: Optional[str] = None
     rag_used: Optional[bool] = None
+    summary_mode: Optional[bool] = None
+    summary_mode_reason: Optional[str] = None
     processing_time: float
     conversation_id: str
     conversation_title: Optional[str] = None
@@ -209,6 +211,8 @@ class ConversationMessage(BaseModel):
     detectedLanguage: Optional[str] = None
     intent: Optional[str] = None
     ragUsed: Optional[bool] = None
+    summaryMode: Optional[bool] = None
+    summaryModeReason: Optional[str] = None
     status: Optional[str] = None
     debugLogs: Optional[List[str]] = None
     
@@ -387,6 +391,8 @@ async def chat(request: QueryRequest):
             "detectedLanguage": result.get("detected_language", result.get("language", "unknown")),
             "intent": result.get("intent", "task_or_policy"),
             "ragUsed": result.get("rag_used", True),
+            "summaryMode": result.get("summary_mode", False),
+            "summaryModeReason": result.get("summary_mode_reason"),
             "status": result.get("status", "unknown"),
             "debugLogs": result.get("debug_logs", []),
         }
@@ -409,6 +415,8 @@ async def chat(request: QueryRequest):
             "evidence": result.get("evidence", []),
             "intent": result.get("intent", "task_or_policy"),
             "rag_used": result.get("rag_used", True),
+            "summary_mode": result.get("summary_mode", False),
+            "summary_mode_reason": result.get("summary_mode_reason"),
             "processing_time": round(processing_time, 2),
             "conversation_id": conversation_id,
             "conversation_title": conversation.get("title"),
@@ -535,7 +543,7 @@ async def source_preview(
 
 @app.get("/api/conversations", response_model=ConversationListResponse)
 async def list_conversations():
-    conversations = conversation_store.list_conversations(limit=20)
+    conversations = conversation_store.list_conversations()
     return {"conversations": [{**conversation, "messages": []} for conversation in conversations]}
 
 
@@ -550,6 +558,15 @@ async def get_conversation(conversation_id: str):
     try:
         conversation = conversation_store.refresh_summary(conversation_id)
         return conversation
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    try:
+        conversation_store.delete_conversation(conversation_id)
+        return {"success": True, "conversation_id": conversation_id}
     except KeyError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
 

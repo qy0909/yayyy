@@ -69,19 +69,46 @@ class ConversationStore:
 
         return self.get_conversation(conversation_id)
 
-    def list_conversations(self, limit: int = 20) -> List[Dict[str, Any]]:
+    def list_conversations(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT id, title, summary, created_at, updated_at
-                FROM conversations
-                ORDER BY updated_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            if limit is None:
+                rows = connection.execute(
+                    """
+                    SELECT id, title, summary, created_at, updated_at
+                    FROM conversations
+                    ORDER BY updated_at DESC
+                    """
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT id, title, summary, created_at, updated_at
+                    FROM conversations
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
 
         return [dict(row) for row in rows]
+
+    def delete_conversation(self, conversation_id: str) -> None:
+        with self._lock, self._connect() as connection:
+            existing = connection.execute(
+                "SELECT id FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if existing is None:
+                raise KeyError(f"Conversation not found: {conversation_id}")
+
+            connection.execute(
+                "DELETE FROM messages WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            connection.execute(
+                "DELETE FROM conversations WHERE id = ?",
+                (conversation_id,),
+            )
 
     def get_conversation(self, conversation_id: str) -> Dict[str, Any]:
         import json

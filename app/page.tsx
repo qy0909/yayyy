@@ -3,7 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { 
   Mic, Send, Volume2, HeartPulse, Scale, 
   ShieldCheck, History, Menu, X, PlusCircle, 
-  ExternalLink, FileText, Search, Loader2, Info
+  ExternalLink, FileText, Search, Loader2, Info, Trash2
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -68,6 +68,8 @@ type ChatMessage = {
   evidence?: EvidenceItem[];
   intent?: string;
   ragUsed?: boolean;
+  summaryMode?: boolean;
+  summaryModeReason?: string;
   dialect?: string;
   status?: string;
   detectedLanguage?: string;
@@ -267,6 +269,8 @@ export default function InclusiveApp() {
           detectedLanguage: message.detectedLanguage,
           intent: message.intent,
           ragUsed: message.ragUsed,
+          summaryMode: message.summaryMode,
+          summaryModeReason: message.summaryModeReason,
           status: message.status,
           debugLogs: message.debugLogs || [],
           created_at: message.created_at,
@@ -312,6 +316,32 @@ export default function InclusiveApp() {
       setCurrentDebugLogs([]);
       resetPreview();
       return null;
+    }
+  };
+
+  const deleteConversation = async (conversationId: string) => {
+    const confirmed = window.confirm('Delete this conversation permanently?');
+    if (!confirmed) return;
+
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}`, {
+        method: 'DELETE',
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.error || 'Failed to delete conversation');
+      }
+
+      const updatedConversations = await refreshConversations();
+      if (currentConversationId === conversationId) {
+        if (updatedConversations.length > 0) {
+          await loadConversation(updatedConversations[0].id);
+        } else {
+          await createConversation();
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to delete conversation:', error);
     }
   };
 
@@ -615,6 +645,8 @@ export default function InclusiveApp() {
           evidence: result.evidence || [],
           intent: result.intent,
           ragUsed: result.rag_used,
+          summaryMode: !!result.summary_mode,
+          summaryModeReason: result.summary_mode_reason,
           dialect: detectedLanguage,
           detectedLanguage: result.detected_language,
           status: result.success ? 'verified' : 'no_results',
@@ -692,21 +724,34 @@ export default function InclusiveApp() {
             <p className="text-[11px] font-bold text-slate-400 uppercase tracking-[0.15em] mb-4">Recent Conversations</p>
             <div className="space-y-3">
               {conversations.map((conversation) => (
-                <button
-                  key={conversation.id}
-                  onClick={async () => {
-                    await loadConversation(conversation.id);
-                    setIsSidebarOpen(false);
-                  }}
-                  className={`w-full p-4 text-left rounded-xl border text-sm transition-colors ${
-                    currentConversationId === conversation.id
-                      ? 'bg-emerald-50 border-emerald-300 text-slate-700'
-                      : 'bg-slate-50 border-slate-200 text-slate-500 hover:border-emerald-300'
-                  }`}
-                >
-                  <p className="font-semibold text-slate-700 mb-1 line-clamp-2">{conversation.title}</p>
-                  <p className="text-[11px] opacity-60 mt-2">{formatConversationTime(conversation.updated_at)}</p>
-                </button>
+                <div key={conversation.id} className="relative group">
+                  <button
+                    onClick={async () => {
+                      await loadConversation(conversation.id);
+                      setIsSidebarOpen(false);
+                    }}
+                    className={`w-full p-4 pr-12 text-left rounded-xl border text-sm transition-colors ${
+                      currentConversationId === conversation.id
+                        ? 'bg-emerald-50 border-emerald-300 text-slate-700'
+                        : 'bg-slate-50 border-slate-200 text-slate-500 hover:border-emerald-300'
+                    }`}
+                  >
+                    <p className="font-semibold text-slate-700 mb-1 line-clamp-2">{conversation.title}</p>
+                    <p className="text-[11px] opacity-60 mt-2">{formatConversationTime(conversation.updated_at)}</p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      deleteConversation(conversation.id);
+                    }}
+                    className="absolute top-3 right-3 p-1.5 rounded-lg bg-white border border-slate-200 text-slate-500 hover:text-rose-600 hover:border-rose-300 transition-opacity opacity-0 group-hover:opacity-100 focus:opacity-100"
+                    title="Delete conversation"
+                    aria-label="Delete conversation"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
               ))}
             </div>
           </div>
@@ -781,6 +826,14 @@ export default function InclusiveApp() {
                     {m.ragUsed === false && (
                       <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider bg-slate-100 text-slate-500 border border-slate-200">
                         💬 Direct Answer
+                      </span>
+                    )}
+                    {m.summaryMode === true && (
+                      <span
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider bg-amber-50 text-amber-700 border border-amber-200"
+                        title={m.summaryModeReason ? `Summary mode: ${m.summaryModeReason}` : 'Summary mode enabled'}
+                      >
+                        📝 Summary Mode
                       </span>
                     )}
                   </div>

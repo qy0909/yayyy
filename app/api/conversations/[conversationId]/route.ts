@@ -10,7 +10,7 @@ type PythonApiResponse = {
   data: unknown;
 };
 
-function callPythonApi(path: string, method: 'GET'): Promise<PythonApiResponse> {
+function callPythonApi(path: string, method: 'GET' | 'DELETE'): Promise<PythonApiResponse> {
   const baseUrl = new URL(PYTHON_API_URL);
   const isHttps = baseUrl.protocol === 'https:';
   const client = isHttps ? https : http;
@@ -71,6 +71,26 @@ export async function GET(_: Request, context: RouteContext) {
     return NextResponse.json(
       {
         error: error instanceof Error ? error.message : 'Failed to load conversation',
+      },
+      { status: 500 }
+    );
+  }
+}
+
+export async function DELETE(_: Request, context: RouteContext) {
+  try {
+    const { conversationId } = await context.params;
+    const response = await callPythonApi(`/api/conversations/${conversationId}`, 'DELETE');
+
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`Python API returned ${response.status}`);
+    }
+
+    return NextResponse.json(response.data);
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error: error instanceof Error ? error.message : 'Failed to delete conversation',
       },
       { status: 500 }
     );

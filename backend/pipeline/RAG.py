@@ -242,6 +242,10 @@ AUTO_SUMMARY_LONG_CHUNK_COUNT = int(os.getenv('AUTO_SUMMARY_LONG_CHUNK_COUNT', '
 AUTO_SUMMARY_COMPLEX_SOURCE_COUNT = int(os.getenv('AUTO_SUMMARY_COMPLEX_SOURCE_COUNT', '3'))
 AUTO_SUMMARY_COMPLEX_CONTEXT_CHARS = int(os.getenv('AUTO_SUMMARY_COMPLEX_CONTEXT_CHARS', '900'))
 
+# Recursive summarization controls for chat summary-mode responses.
+RECURSIVE_SUMMARY_CHUNK_SIZE = int(os.getenv('RECURSIVE_SUMMARY_CHUNK_SIZE', '1200'))
+RECURSIVE_SUMMARY_INPUT_MAX_CHARS = int(os.getenv('RECURSIVE_SUMMARY_INPUT_MAX_CHARS', '14000'))
+
 # Maximum tokens for LLM response
 MAX_TOKENS = 550 if SPEED_MODE else 1000
 
@@ -1538,6 +1542,7 @@ Instructions:
         compressed_chunks: Optional[List[Dict[str, Any]]] = None,
         answer_style_override: Optional[str] = None,
         recursive_context_summary: str = "",
+        compact_citation_mode: bool = False,
     ) -> str:
         """
         Prepare the prompt for the LLM with retrieved context
@@ -1743,7 +1748,7 @@ Instructions:
 10. Start with the answer directly. Avoid stock lead-ins such as "Here's a helpful response", "Here's a simplified explanation", "Here's a guide", or similar filler.
 11. Avoid sounding like a template. Do not add decorative titles or headings unless they are needed to explain steps clearly.
 12. If the user is asking a follow-up question, use the recent conversation to resolve references like "it", "that", or "the deadline" before answering.
-13. When you use information from a source, add an inline citation tag like [S1] or [S2] immediately after the relevant sentence. Use the source numbers provided in the Retrieved Official Context above.
+13. {"For summary-style outputs, do not add citation tags to every sentence. Add at most one citation tag per bullet (for example [S1]) or provide one short source line at the end." if compact_citation_mode else "When you use information from a source, add an inline citation tag like [S1] or [S2] immediately after the relevant sentence. Use the source numbers provided in the Retrieved Official Context above."}
 14. Prefer specific facts from the context (for example, eligibility criteria, timelines, or document names) over generic advice when such facts are available.
 15. If Recursive Context Summary is provided, use it to stay concise, but verify details against Retrieved Official Context before finalizing.
 16. Think through the answer internally, but output only the final answer without showing hidden reasoning.
@@ -1758,6 +1763,72 @@ Do not simply repeat document snippets. Synthesize them into one helpful answer.
         
         print(f"   ✓ Prompt prepared ({len(prompt)} characters)")
         return prompt
+
+    def _expand_chunks_by_source_url(self, retrieved_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Expand retrieval set by loading all chunks for each matched source_url."""
+        if not retrieved_chunks:
+            return []
+
+        source_order: List[str] = []
+        source_best_scores: Dict[str, Dict[str, float]] = {}
+
+        for chunk in retrieved_chunks:
+            source_url = (chunk.get('source_url') or chunk.get('url') or '').strip()
+            if not source_url:
+                continue
+
+            if source_url not in source_order:
+                source_order.append(source_url)
+
+            rerank_score = float(chunk.get('rerank_score') or 0.0)
+            similarity = float(chunk.get('similarity') or 0.0)
+            previous = source_best_scores.get(source_url, {'rerank_score': 0.0, 'similarity': 0.0})
+            source_best_scores[source_url] = {
+                'rerank_score': max(previous.get('rerank_score', 0.0), rerank_score),
+                'similarity': max(previous.get('similarity', 0.0), similarity),
+            }
+
+        if not source_order:
+            return retrieved_chunks
+
+        expanded_chunks: List[Dict[str, Any]] = []
+        for source_url in source_order:
+            try:
+                response = (
+                    self.supabase_client
+                    .table('embeddings')
+                    .select('title,content,source_url,chunk_index,total_chunks,page_number,page_start,page_end,section,subsection,source_type,language')
+                    .eq('source_url', source_url)
+                    .order('chunk_index', desc=False)
+                    .execute()
+                )
+                source_rows = response.data or []
+            except Exception as error:
+                self._log_debug(f"[Step 4] ⚠️ Failed expanding source chunks for {source_url}: {error}")
+                source_rows = []
+
+            if not source_rows:
+                # Fallback to original retrieved chunks from this source.
+                fallback_rows = [
+                    chunk for chunk in retrieved_chunks
+                    if (chunk.get('source_url') or chunk.get('url') or '').strip() == source_url
+                ]
+                expanded_chunks.extend(fallback_rows)
+                continue
+
+            score_meta = source_best_scores.get(source_url, {'rerank_score': 0.0, 'similarity': 0.0})
+            for row in source_rows:
+                enriched_row = dict(row)
+                enriched_row['url'] = source_url
+                enriched_row['rerank_score'] = score_meta.get('rerank_score', 0.0)
+                enriched_row['similarity'] = score_meta.get('similarity', 0.0)
+                expanded_chunks.append(enriched_row)
+
+        self._log_debug(
+            f"[Step 4] 📚 Expanded retrieval from {len(retrieved_chunks)} matched chunks to "
+            f"{len(expanded_chunks)} chunks across {len(source_order)} source URL(s)"
+        )
+        return expanded_chunks or retrieved_chunks
 
     def _should_auto_action_bullet_summary(
         self,
@@ -2216,6 +2287,7 @@ Always:
         allow_step_format: bool = False,
         conversation_history: Optional[List[Dict[str, str]]] = None,
         answer_style_override: Optional[str] = None,
+        strip_citations: bool = False,
     ) -> Dict[str, Any]:
         """
         Format the LLM response for frontend display
@@ -2311,6 +2383,10 @@ Always:
             cleaned_response,
             flags=re.IGNORECASE,
         )
+        if strip_citations:
+            cleaned_response = re.sub(r"\[\s*S\d+\s*\]", "", cleaned_response, flags=re.IGNORECASE)
+            cleaned_response = re.sub(r"\s{2,}", " ", cleaned_response)
+            self._log_debug("[Step 6] 🧹 Summary mode: inline citations removed from answer text")
         paragraphs = [segment.strip() for segment in re.split(r'\n\s*\n', cleaned_response) if segment.strip()]
 
         if effective_answer_style == 'bullet':
@@ -2476,27 +2552,57 @@ Final bullet points:
 
     def _chunk_text(self, text: str, chunk_size: int) -> List[str]:
         """Splits text into chunks of a specified size without breaking sentences."""
-        if len(text) <= chunk_size:
-            return [text]
+        cleaned = (text or '').strip()
+        if not cleaned:
+            return []
+
+        if len(cleaned) <= chunk_size:
+            return [cleaned]
 
         nlp = self.nlp_en if all(ord(ch) < 128 for ch in text[:200]) else self.nlp_multi
         try:
-            doc = nlp(text)
+            doc = nlp(cleaned)
             sentences = [s.text for s in doc.sents]
         except Exception:
-            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', cleaned) if s.strip()]
+
+        def split_oversized_sentence(sentence: str) -> List[str]:
+            sentence = sentence.strip()
+            if len(sentence) <= chunk_size:
+                return [sentence]
+
+            words = sentence.split()
+            if not words:
+                return [sentence[:chunk_size]]
+
+            parts: List[str] = []
+            current = ""
+            for word in words:
+                candidate = f"{current} {word}".strip() if current else word
+                if len(candidate) > chunk_size and current:
+                    parts.append(current)
+                    current = word
+                else:
+                    current = candidate
+            if current:
+                parts.append(current)
+            return parts
 
         chunks = []
         current_chunk = ""
         for sentence in sentences:
-            if len(current_chunk) + len(sentence) > chunk_size:
-                chunks.append(current_chunk)
-                current_chunk = sentence
-            else:
-                current_chunk += " " + sentence
+            for part in split_oversized_sentence(sentence):
+                if not part:
+                    continue
+                candidate = f"{current_chunk} {part}".strip() if current_chunk else part
+                if len(candidate) > chunk_size and current_chunk:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = part
+                else:
+                    current_chunk = candidate
         
         if current_chunk:
-            chunks.append(current_chunk)
+            chunks.append(current_chunk.strip())
             
         return chunks
 
@@ -2836,25 +2942,42 @@ Simplified text:
             compressed_chunks = self._compress_retrieved_chunks(query_for_retrieval, retrieved_chunks)
             effective_answer_style = ANSWER_STYLE
             summary_requested = self._is_summary_request(user_query)
+            auto_summary_triggered = False
             if summary_requested:
                 effective_answer_style = 'bullet'
                 self._log_debug("[Step 4] 🧭 User requested summary; forcing bullet summary mode")
             elif self._should_auto_action_bullet_summary(user_query, retrieved_chunks, compressed_chunks):
                 effective_answer_style = 'bullet'
+                auto_summary_triggered = True
             self._log_debug(f"[Step 4] ✍️ Effective response style: {effective_answer_style}")
 
+            summary_mode_active = summary_requested or auto_summary_triggered
+            summary_mode_reason = 'user_requested' if summary_requested else ('auto_long_context' if auto_summary_triggered else None)
+
             recursive_context_summary = ""
+            summary_context_chunks = retrieved_chunks
             if effective_answer_style == 'bullet':
+                summary_context_chunks = self._expand_chunks_by_source_url(retrieved_chunks)
                 recursive_source_blocks = []
-                for idx, chunk in enumerate(compressed_chunks, 1):
-                    chunk_text = (chunk.get('summary') or chunk.get('content') or chunk.get('text') or '').strip()
+                for idx, chunk in enumerate(summary_context_chunks, 1):
+                    # Use richer chunk text here so recursive summarization has enough depth.
+                    chunk_text = (chunk.get('content') or chunk.get('text') or chunk.get('summary') or '').strip()
                     if chunk_text:
                         recursive_source_blocks.append(f"[S{idx}] {chunk_text}")
 
                 recursive_input_text = "\n\n".join(recursive_source_blocks).strip()
+                if len(recursive_input_text) > RECURSIVE_SUMMARY_INPUT_MAX_CHARS:
+                    recursive_input_text = recursive_input_text[:RECURSIVE_SUMMARY_INPUT_MAX_CHARS]
+
                 if recursive_input_text:
-                    self._log_debug("[Step 4] 🔁 Running recursive summarization for summary-mode response")
-                    recursive_context_summary = self.summarize_document(recursive_input_text, chunk_size=2800)
+                    self._log_debug(
+                        "[Step 4] 🔁 Running recursive summarization for summary-mode response "
+                        f"(chars={len(recursive_input_text)}, chunk_size={RECURSIVE_SUMMARY_CHUNK_SIZE})"
+                    )
+                    recursive_context_summary = self.summarize_document(
+                        recursive_input_text,
+                        chunk_size=RECURSIVE_SUMMARY_CHUNK_SIZE,
+                    )
                 else:
                     self._log_debug("[Step 4] ⚠️ Skipping recursive summarization (empty context after compression)")
 
@@ -2892,6 +3015,7 @@ Simplified text:
                 compressed_chunks=compressed_chunks,
                 answer_style_override=effective_answer_style,
                 recursive_context_summary=recursive_context_summary,
+                compact_citation_mode=(effective_answer_style == 'bullet'),
             )
             self._log_debug(f"[Step 4] ✓ Prompt prepared (length: {len(prompt)})")
             
@@ -2909,6 +3033,7 @@ Simplified text:
                 allow_step_format=is_process_question,
                 conversation_history=conversation_history,
                 answer_style_override=effective_answer_style,
+                strip_citations=summary_mode_active,
             )
             
             # Step 6.5: Translate answer back to user's dialect
@@ -2971,6 +3096,8 @@ Simplified text:
             final_response['intent'] = 'task_or_policy'
             final_response['rag_used'] = True
             final_response['evidence'] = evidence
+            final_response['summary_mode'] = summary_mode_active
+            final_response['summary_mode_reason'] = summary_mode_reason
 
             # Add sources for frontend display with all required fields
             formatted_sources = []
