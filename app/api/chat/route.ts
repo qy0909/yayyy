@@ -71,7 +71,7 @@ function callPythonApi(path: string, method: 'GET' | 'POST', body?: unknown): Pr
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { query, top_k = 5, conversation_id, conversation_history = [] } = body;
+    const { query, top_k = 5, summary_mode_enabled = null, conversation_id, conversation_history = [] } = body;
 
     if (!query) {
       return NextResponse.json(
@@ -84,6 +84,7 @@ export async function POST(request: NextRequest) {
     const response = await callPythonApi('/api/chat', 'POST', {
       query,
       top_k,
+      summary_mode_enabled,
       conversation_id,
       conversation_history,
     });

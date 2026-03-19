@@ -15,6 +15,8 @@ type EvidenceItem = {
   original_excerpt: string;
   rerank_score?: number | null;
   similarity?: number | null;
+  cited_in_answer?: boolean;
+  citation_usage_count?: number;
 };
 
 type SourceItem = {
@@ -70,6 +72,14 @@ type ChatMessage = {
   ragUsed?: boolean;
   summaryMode?: boolean;
   summaryModeReason?: string;
+  usedCitationTags?: string[];
+  unusedCitationTags?: string[];
+  citationStats?: {
+    used_count?: number;
+    unused_count?: number;
+    retrieved_count?: number;
+    coverage?: number;
+  };
   dialect?: string;
   status?: string;
   detectedLanguage?: string;
@@ -134,6 +144,12 @@ const formatConversationTime = (isoDate: string): string => {
   return `${days} day${days === 1 ? '' : 's'} ago`;
 };
 
+const splitEvidenceByCitationUsage = (evidence: EvidenceItem[] = []) => {
+  const cited = evidence.filter((item) => item.cited_in_answer !== false);
+  const additional = evidence.filter((item) => item.cited_in_answer === false);
+  return { cited, additional };
+};
+
 export default function InclusiveApp() {
   const [input, setInput] = useState("");
   const [language, setLanguage] = useState("ms-MY");
@@ -158,6 +174,7 @@ export default function InclusiveApp() {
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [currentAudio, setCurrentAudio] = useState<HTMLAudioElement | null>(null);
   const [showStarterChips, setShowStarterChips] = useState(false);
+  const [summaryModeEnabled, setSummaryModeEnabled] = useState(false);
   const showPreviewPanel = previewLoading || !!previewError || !!previewData;
 
   const syncLocalMessages = (nextMessages: ChatMessage[]) => {
@@ -609,7 +626,8 @@ export default function InclusiveApp() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           query: textToSend,
-          top_k: 5,
+          top_k: 8,
+          summary_mode_enabled: summaryModeEnabled,
           conversation_id: activeConversationId,
           conversation_history: conversationHistory,
         }),
@@ -647,6 +665,9 @@ export default function InclusiveApp() {
           ragUsed: result.rag_used,
           summaryMode: !!result.summary_mode,
           summaryModeReason: result.summary_mode_reason,
+          usedCitationTags: result.used_citation_tags || [],
+          unusedCitationTags: result.unused_citation_tags || [],
+          citationStats: result.citation_stats || {},
           dialect: detectedLanguage,
           detectedLanguage: result.detected_language,
           status: result.success ? 'verified' : 'no_results',
@@ -850,6 +871,12 @@ export default function InclusiveApp() {
                     {/* Evidence section — original source excerpts with citation tags */}
                     {m.evidence && m.evidence.length > 0 && (
                       <div className="space-y-1">
+                        {(() => {
+                          const split = splitEvidenceByCitationUsage(m.evidence as EvidenceItem[]);
+                          const citedEvidence = split.cited;
+                          const additionalEvidence = split.additional;
+                          return (
+                            <>
                         <button
                           type="button"
                           onClick={() => {
@@ -862,11 +889,16 @@ export default function InclusiveApp() {
                           className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-amber-100 text-amber-800 border border-amber-300 hover:bg-amber-200 hover:text-amber-900 transition-colors shadow-sm"
                         >
                           <FileText size={12} />
-                          {expandedEvidence.has(i) ? '▾' : '▸'} Original Source Excerpts ({m.evidence.length})
+                          {expandedEvidence.has(i) ? '▾' : '▸'} Source Excerpts ({m.evidence.length})
                         </button>
                         {expandedEvidence.has(i) && (
                           <div className="space-y-2 mt-2">
-                            {m.evidence.map((ev: EvidenceItem, evIdx: number) => (
+                            {citedEvidence.length > 0 && (
+                              <p className="text-[10px] font-bold uppercase tracking-wider text-emerald-700 px-1">
+                                Cited in answer ({citedEvidence.length})
+                              </p>
+                            )}
+                            {citedEvidence.map((ev: EvidenceItem, evIdx: number) => (
                               <div key={evIdx} className="bg-amber-50 border border-amber-200 rounded-xl p-3">
                                 <div className="flex items-center justify-between mb-1.5">
                                   <button
@@ -879,6 +911,9 @@ export default function InclusiveApp() {
                                   </button>
                                   <span className="text-[10px] text-slate-500 font-medium truncate ml-2 flex-1 text-right">
                                     {ev.source_name}
+                                    {ev.citation_usage_count ? (
+                                      <span className="ml-1 text-blue-600">· cited {ev.citation_usage_count}x</span>
+                                    ) : null}
                                     {(ev.rerank_score != null || ev.similarity != null) && (
                                       <span className="ml-1 text-emerald-600">
                                         · {(((ev.rerank_score ?? ev.similarity) as number) * 100).toFixed(0)}% selection
@@ -907,8 +942,44 @@ export default function InclusiveApp() {
                                 )}
                               </div>
                             ))}
+                            {additionalEvidence.length > 0 && (
+                              <p className="text-[10px] font-bold uppercase tracking-wider text-slate-500 px-1 pt-2">
+                                Retrieved but not cited ({additionalEvidence.length})
+                              </p>
+                            )}
+                            {additionalEvidence.map((ev: EvidenceItem, evIdx: number) => (
+                              <div key={`${ev.citation_tag}-unused-${evIdx}`} className="bg-slate-50 border border-slate-200 rounded-xl p-3">
+                                <div className="flex items-center justify-between mb-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleCitationJump(i, ev.citation_tag, m.sources as SourceItem[] | undefined)}
+                                    className="text-[10px] font-bold text-slate-600 bg-slate-100 px-2 py-0.5 rounded-full hover:bg-slate-200 hover:text-slate-800 transition-colors"
+                                    title="Jump to retrieved chunk"
+                                  >
+                                    [{ev.citation_tag}]
+                                  </button>
+                                  <span className="text-[10px] text-slate-500 font-medium truncate ml-2 flex-1 text-right">
+                                    {ev.source_name}
+                                    <span className="ml-1 text-slate-400">· not cited</span>
+                                  </span>
+                                </div>
+                                <p className="text-[11px] text-slate-600 italic leading-relaxed line-clamp-3">
+                                  &ldquo;{ev.original_excerpt}&rdquo;
+                                </p>
+                                <button
+                                  type="button"
+                                  onClick={() => handleCitationJump(i, ev.citation_tag, m.sources as SourceItem[] | undefined)}
+                                  className="mt-1.5 text-[10px] text-slate-600 hover:underline"
+                                >
+                                  View retrieved chunk
+                                </button>
+                              </div>
+                            ))}
                           </div>
                         )}
+                            </>
+                          );
+                        })()}
                       </div>
                     )}
 
@@ -1058,6 +1129,26 @@ export default function InclusiveApp() {
 
           {/* Chat Input Area */}
           <div className="max-w-4xl mx-auto">
+            <div className="flex items-center justify-between px-1 mb-2">
+              <button
+                type="button"
+                onClick={() => setSummaryModeEnabled((prev) => !prev)}
+                className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-[11px] font-bold uppercase tracking-wider border transition-colors ${
+                  summaryModeEnabled
+                    ? 'bg-amber-50 text-amber-700 border-amber-300 hover:bg-amber-100'
+                    : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'
+                }`}
+                title={summaryModeEnabled ? 'Summary mode is ON for next replies' : 'Summary mode is OFF for next replies'}
+              >
+                <FileText size={12} />
+                Summarize Replies: {summaryModeEnabled ? 'On' : 'Off'}
+              </button>
+              <p className="text-[11px] text-slate-500 font-medium">
+                {summaryModeEnabled
+                  ? 'Compact bullet answers with fewer inline citations'
+                  : 'Detailed answers with inline citations'}
+              </p>
+            </div>
             <div className="relative flex items-end gap-3 bg-slate-50 border-2 border-slate-200 rounded-[2rem] p-2 focus-within:border-emerald-500 transition-all shadow-inner overflow-hidden min-h-[72px]">
               
               {/* LISTENING OVERLAY */}

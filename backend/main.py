@@ -158,6 +158,7 @@ class QueryRequest(BaseModel):
     query: str
     user_language: Optional[str] = None  # If user wants to specify language
     top_k: Optional[int] = 5
+    summary_mode_enabled: Optional[bool] = None
     conversation_id: Optional[str] = None
     conversation_history: Optional[List[Dict[str, str]]] = None
     
@@ -189,6 +190,9 @@ class QueryResponse(BaseModel):
     rag_used: Optional[bool] = None
     summary_mode: Optional[bool] = None
     summary_mode_reason: Optional[str] = None
+    used_citation_tags: Optional[List[str]] = None
+    unused_citation_tags: Optional[List[str]] = None
+    citation_stats: Optional[Dict[str, Any]] = None
     processing_time: float
     conversation_id: str
     conversation_title: Optional[str] = None
@@ -213,6 +217,9 @@ class ConversationMessage(BaseModel):
     ragUsed: Optional[bool] = None
     summaryMode: Optional[bool] = None
     summaryModeReason: Optional[str] = None
+    usedCitationTags: Optional[List[str]] = None
+    unusedCitationTags: Optional[List[str]] = None
+    citationStats: Optional[Dict[str, Any]] = None
     status: Optional[str] = None
     debugLogs: Optional[List[str]] = None
     
@@ -373,6 +380,8 @@ async def chat(request: QueryRequest):
         result = pipeline.process_query(
             user_query=request.query,
             user_language_hint=request.user_language,
+            top_k=request.top_k,
+            summary_mode_enabled=request.summary_mode_enabled,
             conversation_history=effective_history,
             conversation_summary=conversation.get("summary", ""),
         )
@@ -393,6 +402,9 @@ async def chat(request: QueryRequest):
             "ragUsed": result.get("rag_used", True),
             "summaryMode": result.get("summary_mode", False),
             "summaryModeReason": result.get("summary_mode_reason"),
+            "usedCitationTags": result.get("used_citation_tags", []),
+            "unusedCitationTags": result.get("unused_citation_tags", []),
+            "citationStats": result.get("citation_stats", {}),
             "status": result.get("status", "unknown"),
             "debugLogs": result.get("debug_logs", []),
         }
@@ -417,6 +429,9 @@ async def chat(request: QueryRequest):
             "rag_used": result.get("rag_used", True),
             "summary_mode": result.get("summary_mode", False),
             "summary_mode_reason": result.get("summary_mode_reason"),
+            "used_citation_tags": result.get("used_citation_tags", []),
+            "unused_citation_tags": result.get("unused_citation_tags", []),
+            "citation_stats": result.get("citation_stats", {}),
             "processing_time": round(processing_time, 2),
             "conversation_id": conversation_id,
             "conversation_title": conversation.get("title"),
