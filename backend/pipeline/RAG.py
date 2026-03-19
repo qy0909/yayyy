@@ -11,6 +11,7 @@ This pipeline handles user queries through:
 
 import os
 import re
+import unicodedata
 from typing import List, Dict, Any, Optional
 import json
 import time
@@ -173,11 +174,14 @@ LOCAL_EMBEDDING_STANDBY = os.getenv('LOCAL_EMBEDDING_STANDBY', 'true' if SPEED_M
 # ============================================================================
 
 # Number of similar documents to retrieve
-TOP_K_RESULTS = int(os.getenv('TOP_K_RESULTS', '3'))
+# Increased from 3 to 6 for better context breadth
+TOP_K_RESULTS = int(os.getenv('TOP_K_RESULTS', '6'))
 
 # Pull more than top-k from Supabase, then rerank/filter in Python.
-VECTOR_CANDIDATE_MULTIPLIER = int(os.getenv('VECTOR_CANDIDATE_MULTIPLIER', '4'))
-VECTOR_MIN_CANDIDATES = int(os.getenv('VECTOR_MIN_CANDIDATES', '10'))
+# Increased from 4 to 10 for wider candidate pool (~240 candidates before rerank)
+VECTOR_CANDIDATE_MULTIPLIER = int(os.getenv('VECTOR_CANDIDATE_MULTIPLIER', '10'))
+# Increased from 10 to 40 for minimum candidate threshold
+VECTOR_MIN_CANDIDATES = int(os.getenv('VECTOR_MIN_CANDIDATES', '40'))
 
 # Quality filters to avoid tiny chunks like single-word headings.
 MIN_RETRIEVED_CHUNK_CHARS = int(os.getenv('MIN_RETRIEVED_CHUNK_CHARS', '60'))
@@ -236,7 +240,9 @@ CHUNK_SUMMARY_MAX_SENTENCES = 3 if SPEED_MODE else 4
 TOTAL_CONTEXT_MAX_CHARS = 2200 if SPEED_MODE else 3200
 
 # Auto summary mode: switch to actionable 3-5 bullets when retrieved context is long/complex.
-AUTO_ACTION_BULLET_SUMMARY = os.getenv('AUTO_ACTION_BULLET_SUMMARY', 'true').lower() in {'1', 'true', 'yes'}
+# DISABLED by default to preserve inline citations. Only explicit user intent ("summarize", "ringkasan") triggers summary.
+# This ensures detailed citations remain the default, and summary is opt-in, not automatic.
+AUTO_ACTION_BULLET_SUMMARY = os.getenv('AUTO_ACTION_BULLET_SUMMARY', 'false').lower() in {'1', 'true', 'yes'}
 AUTO_SUMMARY_LONG_CONTEXT_CHARS = int(os.getenv('AUTO_SUMMARY_LONG_CONTEXT_CHARS', '1400'))
 AUTO_SUMMARY_LONG_CHUNK_COUNT = int(os.getenv('AUTO_SUMMARY_LONG_CHUNK_COUNT', '4'))
 AUTO_SUMMARY_COMPLEX_SOURCE_COUNT = int(os.getenv('AUTO_SUMMARY_COMPLEX_SOURCE_COUNT', '3'))
@@ -1120,16 +1126,24 @@ class RAGPipeline:
         if not lowered_query:
             return False
 
+        normalized_query = unicodedata.normalize('NFKD', lowered_query)
+        normalized_query = ''.join(ch for ch in normalized_query if not unicodedata.combining(ch))
+        normalized_query = re.sub(r'\s+', ' ', normalized_query).strip()
+
         summary_keywords = {
             'summarize', 'summary', 'tl;dr', 'tldr',
             'ringkaskan', 'ringkasan', 'rumuskan', 'rumusan',
             'buat ringkas', 'pendekkan',
+            'ringkas', 'rangkum', 'rangkuman', 'simpulkan', 'kesimpulan',
+            'buod', 'ibuod', 'lagumin',
+            'tom tat',
+            'sruob',
         }
-        if any(keyword in lowered_query for keyword in summary_keywords):
+        if any(keyword in normalized_query for keyword in summary_keywords):
             return True
 
         # Support short imperative phrasing such as "in short" / "short version".
-        return bool(re.search(r'\b(in short|short version|briefly)\b', lowered_query))
+        return bool(re.search(r'\b(in short|short version|briefly|in brief)\b', normalized_query))
 
     def classify_query_intent(self, query: str) -> str:
         """
@@ -2956,7 +2970,7 @@ Simplified text:
 
             recursive_context_summary = ""
             summary_context_chunks = retrieved_chunks
-            if effective_answer_style == 'bullet':
+            if summary_requested:
                 summary_context_chunks = self._expand_chunks_by_source_url(retrieved_chunks)
                 recursive_source_blocks = []
                 for idx, chunk in enumerate(summary_context_chunks, 1):
@@ -2980,6 +2994,8 @@ Simplified text:
                     )
                 else:
                     self._log_debug("[Step 4] ⚠️ Skipping recursive summarization (empty context after compression)")
+            elif effective_answer_style == 'bullet':
+                self._log_debug("[Step 4] ⏭️ Recursive summarization disabled (no explicit summary request)")
 
             # Build evidence array from retrieved chunks
             evidence = []
