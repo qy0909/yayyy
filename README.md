@@ -1,36 +1,92 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# SuaraGov - Inclusive Citizen AI
 
-## Getting Started
+**No policy left unclear.** SuaraGov is a multilingual, RAG-powered public service AI assistant designed to help citizens understand government policies, eligibility requirements, and application procedures in plain, simple language.
 
-First, run the development server:
+## 🌟 Key Features
+
+- **Multilingual & Dialect Support:** Automatically detects the user's language (supporting ASEAN languages like Malay, Tagalog, Thai, Vietnamese, Indonesian, etc.) and translates queries/responses using NLLB-200.
+- **Verifiable RAG Pipeline:** Every answer is backed by official government documents. The UI highlights source excerpts and provides jump links to the original text.
+- **Voice-First Accessibility:** Integrated Voice-to-Text (Whisper) for recording queries, and highly human-like Text-to-Speech (Microsoft Edge Neural TTS) for reading answers aloud.
+- **Inclusive Community Dictionary:** Allows users to submit local slang or phrases to be reviewed by admins, improving the AI's understanding of underrepresented communities.
+- **PDF Export:** Users can generate and download a beautifully formatted PDF of their chat history for offline reference.
+- **Multi-User & Snappy UI:** Uses Next.js API routes with a session-based architecture to isolate user chats via Supabase, while utilizing `localStorage` Optimistic UI caching for zero-latency load times.
+
+---
+
+## 🛠 Tech Stack
+
+**Frontend (Vercel-ready)**
+- Next.js (React, TypeScript)
+- Tailwind CSS
+- jsPDF (for offline chat exports)
+- React Markdown
+
+**Backend (Render/Railway-ready)**
+- Python & FastAPI
+- Langdetect & SpaCy (NLP)
+- Supabase (PostgreSQL + pgvector for Embeddings)
+- Groq & Hugging Face Hub (LLM Inference & Translation)
+- OpenAI Whisper & Edge-TTS (Audio processing)
+
+---
+
+## 🚀 Getting Started
+
+### Prerequisites
+- Node.js (v18+)
+- Python (v3.10+)
+- A Supabase account and database
+- Free API Keys: Groq and Hugging Face
+
+### 1. Setup the Backend (FastAPI)
+
+Navigate to the backend directory, set up your virtual environment, and install dependencies:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+# Create and activate virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Download required NLP models
+python -m spacy download en_core_web_sm
+python -m spacy download xx_ent_wiki_sm
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Create a `.env` file in the `backend/` folder (or project root):
+```env
+SUPABASE_URL=your_supabase_project_url
+SUPABASE_KEY=your_supabase_service_role_key
+GROQ_API_KEY=your_groq_api_key
+HF_TOKEN=your_huggingface_token
+SLANG_REVIEW_ADMIN_TOKEN=your_secret_admin_password
+```
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Start the Python server:
+```bash
+cd backend
+python main.py
+# Server runs on http://127.0.0.1:8000
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+### 2. Setup the Frontend (Next.js)
 
-## Learn More
+Open a new terminal and navigate to the root directory:
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+# Install Node modules
+npm install
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Create a `.env.local` file in the root directory:
+```env
+PYTHON_API_URL=http://127.0.0.1:8000
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Start the development server:
+```bash
+npm run dev
+# App runs on http://localhost:3000
+```
