@@ -1224,7 +1224,10 @@ class RAGPipeline:
         user_query: str,
         conversation_history: Optional[List[Dict[str, str]]]
     ) -> Optional[Dict[str, str]]:
-        """Rewrite bare confirmations into context-aware retrieval queries."""
+        """Rewrite bare confirmations into context-aware retrieval queries.
+        
+        Returns the EXACT follow-up question that was asked, along with type classification.
+        """
         if not conversation_history or not self._is_affirmative_confirmation(user_query):
             return None
 
@@ -1252,27 +1255,43 @@ class RAGPipeline:
         if not previous_user_text:
             return None
 
+        # EXTRACT THE EXACT FOLLOW-UP QUESTION (last sentence ending with ?)
+        exact_followup_question = ''
+        sentences = re.split(r'(?<=[.!?])\s+', last_assistant_text)
+        for sent in reversed(sentences):
+            sent_stripped = sent.strip()
+            if sent_stripped.endswith('?'):
+                exact_followup_question = sent_stripped
+                break
+        
+        if not exact_followup_question:
+            exact_followup_question = last_assistant_text if last_assistant_text.endswith('?') else f"{last_assistant_text}?"
+
+        # Classify the follow-up type
         assistant_lower = last_assistant_text.lower()
         followup_type = 'fact_details'
-        if any(marker in assistant_lower for marker in ['next step', 'step-by-step', 'langkah seterusnya', 'walk you through']):
+        if any(marker in assistant_lower for marker in ['next step', 'step-by-step', 'langkah seterusnya', 'walk you through', 'detailed']):
             followup_type = 'process_steps'
-        elif any(marker in assistant_lower for marker in ['checklist', 'required document', 'requirements', 'dokumen', 'syarat']):
+        elif any(marker in assistant_lower for marker in ['checklist', 'required document', 'requirements', 'dokumen', 'syarat', 'eligibility']):
             followup_type = 'eligibility_requirements'
-        elif any(marker in assistant_lower for marker in ['safe option', 'if this gets worse', 'retaliation', 'risk', 'amaran']):
+        elif any(marker in assistant_lower for marker in ['safe option', 'if this gets worse', 'retaliation', 'risk', 'amaran', 'danger', 'threat']):
             followup_type = 'warning_or_risk'
 
+        # Build contextual query that includes both original question AND what the follow-up asked for
         if followup_type == 'process_steps':
-            contextual_query = f"{previous_user_text}. Please provide the detailed next steps in order."
+            contextual_query = f"{previous_user_text}. Provide detailed step-by-step instructions in order."
         elif followup_type == 'eligibility_requirements':
-            contextual_query = f"{previous_user_text}. Please provide full requirements and a document checklist."
+            contextual_query = f"{previous_user_text}. Provide complete eligibility criteria and necessary documents/checklist."
         elif followup_type == 'warning_or_risk':
-            contextual_query = f"{previous_user_text}. Please provide safer options, warnings, and what to do if the risk increases."
+            contextual_query = f"{previous_user_text}. Provide safer alternatives, warnings, and preventive/protective measures."
         else:
-            contextual_query = f"{previous_user_text}. Please provide more details, related policy points, and practical examples."
+            contextual_query = f"{previous_user_text}. Provide more details, examples, and relevant info."
 
         return {
             'followup_type': followup_type,
             'contextual_query': contextual_query,
+            'exact_followup_question': exact_followup_question,  # NEW: The exact question asked
+            'previous_user_question': previous_user_text,  # NEW: Original user question
         }
 
     def _classify_followup_type(self, user_query: str, answer_text: str, allow_step_format: bool) -> str:
@@ -1790,16 +1809,22 @@ Instructions:
         answer_style_override: Optional[str] = None,
         recursive_context_summary: str = "",
         compact_citation_mode: bool = False,
+        is_affirmative_followup: bool = False,
+        original_user_query: Optional[str] = None,
+        exact_followup_question: Optional[str] = None,  # NEW: The exact question to answer
     ) -> str:
         """
         Prepare the prompt for the LLM with retrieved context
         
         Args:
-            user_query: Original user query
+            user_query: User query (or synthesized contextual query if follow-up confirmation)
             retrieved_chunks: Relevant document chunks from vector search
             target_language: Language to translate the answer to
             conversation_history: Recent conversation turns for follow-up context
             conversation_summary: Rolling summary of older conversation context
+            is_affirmative_followup: True if user said "yes" and query was rewritten from context
+            original_user_query: Original "yes"/confirmation if is_affirmative_followup=True
+            exact_followup_question: The EXACT follow-up question user is answering "yes" to
             
         Returns:
             Formatted prompt string
@@ -1947,6 +1972,28 @@ Labour-rights guidance requirements:
         
         # Determine if we're using language auto-detection
         language_instruction = ""
+        followup_context_instruction = ""
+        if is_affirmative_followup and exact_followup_question:
+            followup_context_instruction = f"""
+🎯 FOLLOW-UP CONFIRMATION CONTEXT:
+The assistant previously asked: "{exact_followup_question}"
+The user responded: "{original_user_query}" (confirming YES)
+
+⚠️ CRITICAL INSTRUCTION:
+Your response MUST directly and FULLY answer the question above.
+Do NOT provide a brief or partial answer.
+Do NOT answer a different question.
+FOCUS on addressing what was specifically asked: {exact_followup_question}
+"""
+        elif is_affirmative_followup:
+            followup_context_instruction = f"""
+Follow-up Confirmation Context:
+- The user has confirmed their interest by saying "{original_user_query}" (yes/ok/continue)
+- The following query was AUTOMATICALLY SYNTHESIZED from the previous conversation to capture the user's intent:
+- Query: "{user_query}"
+- Respond directly to this synthesized query using the retrieved context.
+- Make sure your answer DIRECTLY ADDRESSES what the user confirmed they wanted (based on the previous assistant's follow-up offer)."""
+        
         if ENABLE_LANGUAGE_AUTO_DETECTION:
             language_instruction = "User Query (auto-detected): \"" + user_query + "\""
             language_context = """
@@ -1966,6 +2013,7 @@ Mission:
 - Reduce information barriers for users with low literacy or limited digital skills.
 
 {language_instruction}
+{followup_context_instruction}
 
 Earlier Conversation Summary:
 {summary_text}
@@ -1995,8 +2043,8 @@ Instructions:
 10. Start with the answer directly. Avoid stock lead-ins such as "Here's a helpful response", "Here's a simplified explanation", "Here's a guide", or similar filler.
 11. Avoid sounding like a template. Do not add decorative titles or headings unless they are needed to explain steps clearly.
 12. If the user is asking a follow-up question, use the recent conversation to resolve references like "it", "that", or "the deadline" before answering.
-13. {"For summary-style outputs, do not add citation tags to every sentence. Add at most one citation tag per bullet (for example [S1]) or provide one short source line at the end." if compact_citation_mode else "When you use information from a source, add an inline citation tag like [S1] or [S2] immediately after the relevant sentence. Use the source numbers provided in the Retrieved Official Context above."}
-14. Prefer specific facts from the context (for example, eligibility criteria, timelines, or document names) over generic advice when such facts are available.
+{("13. THIS IS AN AFFIRMATIVE FOLLOW-UP: The user previously said \"" + original_user_query + "\" to answer \"" + exact_followup_question + "\". Provide a comprehensive, detailed answer to THAT SPECIFIC QUESTION. Do NOT give a brief answer or answer a different question." if (is_affirmative_followup and exact_followup_question) else "13. " + ("For summary-style outputs, do not add citation tags to every sentence. Add at most one citation tag per bullet (for example [S1]) or provide one short source line at the end." if compact_citation_mode else "When you use information from a source, add an inline citation tag like [S1] or [S2] immediately after the relevant sentence. Use the source numbers provided in the Retrieved Official Context above."))}
+14. When answering follow-up confirmations, prioritize ACCURACY and COMPLETENESS over brevity.
 15. If Recursive Context Summary is provided, use it to stay concise, but verify details against Retrieved Official Context before finalizing.
 16. Think through the answer internally, but output only the final answer without showing hidden reasoning.
 
@@ -3068,12 +3116,27 @@ Simplified text:
                 self._log_debug("[Step 0] 🔄 Labour-office follow-up confirmation detected — overriding intent to task_or_policy")
 
             contextual_followup = self._detect_contextual_followup_confirmation(user_query, conversation_history)
+            is_affirmative_followup = False
+            exact_followup_question = None
             if intent == 'general' and contextual_followup:
                 intent = 'task_or_policy'
                 retrieval_query_override = contextual_followup.get('contextual_query')
+                is_affirmative_followup = True
+                exact_followup_question = contextual_followup.get('exact_followup_question')
                 self._log_debug(
-                    "[Step 0] 🔄 Contextual follow-up confirmation detected "
-                    f"(type={contextual_followup.get('followup_type')}) — overriding intent to task_or_policy"
+                    "[Step 0] 🔄 Contextual follow-up confirmation DETECTED (user said 'YES')"
+                )
+                self._log_debug(
+                    f"[Step 0] ❓ Exact Follow-up Question: {exact_followup_question}"
+                )
+                self._log_debug(
+                    f"[Step 0] 📋 Follow-up Type: {contextual_followup.get('followup_type')}"
+                )
+                self._log_debug(
+                    f"[Step 0] 🔍 Retrieval Query: {contextual_followup.get('contextual_query')[:100]}..."
+                )
+                self._log_debug(
+                    "[Step 0] ⚙️ Overriding intent to task_or_policy for full RAG pipeline"
                 )
 
             # Step 1: Detect language/dialect
@@ -3420,7 +3483,7 @@ Simplified text:
             use_step_gate = ENABLE_STEP_GATE and is_process_question and not step_confirmed
 
             prompt = self.prepare_llm_prompt(
-                query_for_retrieval,  # Use translated query
+                query_for_retrieval,  # Use translated query (or contextual query if "yes" detected)
                 prompt_chunks,
                 detected_language if ENABLE_LANGUAGE_AUTO_DETECTION
                 else ('zsm_Latn' if user_nllb_code != 'eng_Latn' else 'eng_Latn'),
@@ -3431,7 +3494,15 @@ Simplified text:
                 answer_style_override=effective_answer_style,
                 recursive_context_summary=recursive_context_summary,
                 compact_citation_mode=(effective_answer_style == 'bullet'),
+                is_affirmative_followup=is_affirmative_followup,
+                original_user_query=user_query if is_affirmative_followup else None,
+                exact_followup_question=exact_followup_question,  # NEW: Pass exact question
             )
+            if is_affirmative_followup:
+                self._log_debug(f"[Step 4] ✅ LLM will respond to: '{exact_followup_question}'")
+                self._log_debug(f"[Step 4] ✓ Prompt prepared with affirmative followup context (length: {len(prompt)})")
+            else:
+                self._log_debug(f"[Step 4] ✓ Prompt prepared (length: {len(prompt)})")
             self._log_debug(f"[Step 4] ✓ Prompt prepared (length: {len(prompt)})")
             
             # Step 5: Call LLM
