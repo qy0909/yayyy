@@ -10,7 +10,7 @@ type PythonApiResponse = {
   data: unknown;
 };
 
-function callPythonApi(path: string, method: 'GET' | 'POST', body?: unknown): Promise<PythonApiResponse> {
+function callPythonApi(path: string, method: 'GET' | 'POST', body?: unknown, sessionId?: string): Promise<PythonApiResponse> {
   const baseUrl = new URL(PYTHON_API_URL);
   const isHttps = baseUrl.protocol === 'https:';
   const client = isHttps ? https : http;
@@ -27,6 +27,7 @@ function callPythonApi(path: string, method: 'GET' | 'POST', body?: unknown): Pr
         method,
         headers: {
           'Content-Type': 'application/json',
+          'x-session-id': sessionId || 'anonymous-session',
           ...(payload ? { 'Content-Length': Buffer.byteLength(payload).toString() } : {}),
         },
       },
@@ -60,9 +61,10 @@ function callPythonApi(path: string, method: 'GET' | 'POST', body?: unknown): Pr
   });
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
-    const response = await callPythonApi('/api/conversations', 'GET');
+    const sessionId = request.headers.get('x-session-id') || 'anonymous-session';
+    const response = await callPythonApi('/api/conversations', 'GET', undefined, sessionId);
 
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`Python API returned ${response.status}`);
@@ -82,9 +84,10 @@ export async function GET() {
 
 export async function POST(request: NextRequest) {
   try {
+    const sessionId = request.headers.get('x-session-id') || 'anonymous-session';
     const body = await request.json().catch(() => ({}));
 
-    const response = await callPythonApi('/api/conversations', 'POST', body ?? {});
+    const response = await callPythonApi('/api/conversations', 'POST', body ?? {}, sessionId);
 
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`Python API returned ${response.status}`);

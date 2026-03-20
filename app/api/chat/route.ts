@@ -10,7 +10,7 @@ type PythonApiResponse = {
   data: unknown;
 };
 
-function callPythonApi(path: string, method: 'GET' | 'POST', body?: unknown): Promise<PythonApiResponse> {
+function callPythonApi(path: string, method: 'GET' | 'POST', body?: unknown, sessionId?: string): Promise<PythonApiResponse> {
   const baseUrl = new URL(PYTHON_API_URL);
   const isHttps = baseUrl.protocol === 'https:';
   const client = isHttps ? https : http;
@@ -28,6 +28,7 @@ function callPythonApi(path: string, method: 'GET' | 'POST', body?: unknown): Pr
         method,
         headers: {
           'Content-Type': 'application/json',
+          'x-session-id': sessionId || 'anonymous-session',
           ...(payload ? { 'Content-Length': Buffer.byteLength(payload).toString() } : {}),
         },
       },
@@ -80,6 +81,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const sessionId = request.headers.get('x-session-id') || 'anonymous-session';
+
     // Call Python FastAPI backend
     const response = await callPythonApi('/api/chat', 'POST', {
       query,
@@ -87,7 +90,7 @@ export async function POST(request: NextRequest) {
       summary_mode_enabled,
       conversation_id,
       conversation_history,
-    });
+    }, sessionId);
 
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`Python API returned ${response.status}`);

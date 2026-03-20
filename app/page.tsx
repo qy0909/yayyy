@@ -158,6 +158,16 @@ const MAX_HISTORY_MESSAGES = 6;
 const CHAT_HISTORY_STORAGE_KEY = 'chat_history';
 const CONVERSATION_ID_STORAGE_KEY = 'current_conversation_id';
 
+const getSessionId = () => {
+  if (typeof window === 'undefined') return '';
+  let sessionId = localStorage.getItem('user_session_id');
+  if (!sessionId) {
+    sessionId = crypto.randomUUID ? crypto.randomUUID() : 'sess-' + Math.random().toString(36).substring(2, 15);
+    localStorage.setItem('user_session_id', sessionId);
+  }
+  return sessionId;
+};
+
 const getWelcomeMessage = (): ChatMessage => ({
   role: 'assistant',
   text: 'Selamat Datang! I am your Public Service AI. I can explain government policies in simple language or local dialects.',
@@ -300,7 +310,11 @@ export default function InclusiveApp() {
 
   const refreshConversations = async () => {
     try {
-      const response = await fetch('/api/conversations', { cache: 'no-store' });
+      const sessionId = getSessionId();
+      const response = await fetch('/api/conversations', { 
+        cache: 'no-store',
+        headers: { 'x-session-id': sessionId }
+      });
       const result = await response.json();
       if (!response.ok) {
         console.warn('Failed to load conversations:', result?.error || response.statusText);
@@ -317,78 +331,83 @@ export default function InclusiveApp() {
   };
 
   const loadConversation = async (conversationId: string) => {
+    if (!conversationId || conversationId === 'undefined' || conversationId === 'null') return null;
+
     stopAudio();
     setShowStarterChips(false);
     
-    const response = await fetch(`/api/conversations/${conversationId}`, { cache: 'no-store' });
+    const sessionId = getSessionId();
+    const response = await fetch(`/api/conversations/${conversationId}`, { 
+      cache: 'no-store',
+      headers: { 'x-session-id': sessionId }
+    });
     const result = await response.json();
     if (!response.ok) {
       throw new Error(result.error || 'Failed to load conversation');
     }
-
-    const nextMessages = result.messages && result.messages.length > 0
-      ? result.messages.map((message: any) => ({
-          role: message.role,
-          text: message.text,
-          sources: message.sources || [],
-          evidence: message.evidence || [],
-          detectedLanguage: message.detectedLanguage,
-          intent: message.intent,
-          ragUsed: message.ragUsed,
-          summaryMode: message.summaryMode,
-          summaryModeReason: message.summaryModeReason,
-          status: message.status,
-          debugLogs: message.debugLogs || [],
-          created_at: message.created_at,
-        }))
-      : [getWelcomeMessage()];
-
-    setCurrentConversationId(result.id);
-    localStorage.setItem(CONVERSATION_ID_STORAGE_KEY, result.id);
-    syncLocalMessages(nextMessages);
-    resetPreview();
-    return result as ConversationRecord;
+  
+      const nextMessages = result.messages && result.messages.length > 0
+        ? result.messages.map((message: any) => ({
+            role: message.role,
+            text: message.text,
+            sources: message.sources || [],
+            evidence: message.evidence || [],
+            detectedLanguage: message.detectedLanguage,
+            intent: message.intent,
+            ragUsed: message.ragUsed,
+            summaryMode: message.summaryMode,
+            summaryModeReason: message.summaryModeReason,
+            status: message.status,
+            debugLogs: message.debugLogs || [],
+            created_at: message.created_at,
+          }))
+        : [getWelcomeMessage()];
+  
+      setCurrentConversationId(result.id);
+      localStorage.setItem(CONVERSATION_ID_STORAGE_KEY, result.id);
+      syncLocalMessages(nextMessages);
+      resetPreview();
+      return result as ConversationRecord;
   };
 
   const createConversation = async () => {
     stopAudio();
+    setShowStarterChips(true);
     
     try {
+      const sessionId = getSessionId();
       const response = await fetch('/api/conversations', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-session-id': sessionId },
         body: JSON.stringify({}),
       });
       const result = await response.json();
-      if (!response.ok) {
-        throw new Error(result.error || 'Failed to create conversation');
-      }
+      if (!response.ok) throw new Error(result.error || 'Failed to create conversation');
 
       setCurrentConversationId(result.id);
       localStorage.setItem(CONVERSATION_ID_STORAGE_KEY, result.id);
-      syncLocalMessages([getWelcomeMessage()]);
-      setShowStarterChips(true);
+      const initialMessages = [getWelcomeMessage()];
+      syncLocalMessages(initialMessages);
       resetPreview();
       await refreshConversations();
       return result as ConversationRecord;
     } catch (error) {
-      console.warn('Failed to create conversation, falling back to local chat:', error);
-      setCurrentConversationId(null);
-      localStorage.removeItem(CONVERSATION_ID_STORAGE_KEY);
-      syncLocalMessages([getWelcomeMessage()]);
-      setShowStarterChips(true);
-      resetPreview();
+      console.warn('Failed to create conversation:', error);
       return null;
     }
   };
 
   const deleteConversation = async (conversationId: string) => {
+    if (!conversationId || conversationId === 'undefined' || conversationId === 'null') return;
+
     const confirmed = window.confirm('Delete this conversation permanently?');
     if (!confirmed) return;
 
     try {
+      const sessionId = getSessionId();
       const response = await fetch(`/api/conversations/${conversationId}`, {
         method: 'DELETE',
+        headers: { 'x-session-id': sessionId }
       });
       const result = await response.json();
       if (!response.ok) {
@@ -460,7 +479,7 @@ export default function InclusiveApp() {
         const availableConversations = await refreshConversations();
         if (!isMounted) return;
 
-        if (savedConversationId) {
+        if (savedConversationId && savedConversationId !== 'undefined' && savedConversationId !== 'null') {
           const matchingConversation = availableConversations.find((conversation: ConversationRecord) => conversation.id === savedConversationId);
           if (matchingConversation) {
             await loadConversation(savedConversationId);
@@ -667,9 +686,10 @@ export default function InclusiveApp() {
       }
 
       // Call Python RAG backend via Next.js API route
+      const sessionId = getSessionId();
       const response = await fetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-session-id': sessionId },
         body: JSON.stringify({ 
           query: textToSend,
           top_k: 8,

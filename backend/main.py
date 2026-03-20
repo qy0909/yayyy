@@ -15,7 +15,7 @@ if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
@@ -379,7 +379,7 @@ async def transcribe_voice(file: UploadFile = File(...)):
             os.remove(temp_path)
 
 @app.post("/api/chat", response_model=QueryResponse)
-async def chat(request: QueryRequest):
+async def chat(request: QueryRequest, x_session_id: str = Header(default="anonymous-session")):
     """
     Main chat endpoint - processes user query through RAG pipeline
     
@@ -401,11 +401,11 @@ async def chat(request: QueryRequest):
         conversation = None
         try:
             if request.conversation_id:
-                conversation = conversation_store.get_conversation(request.conversation_id)
+                conversation = conversation_store.get_conversation(x_session_id, request.conversation_id)
             else:
-                conversation = conversation_store.create_conversation()
+                conversation = conversation_store.create_conversation(x_session_id)
         except KeyError:
-            conversation = conversation_store.create_conversation()
+            conversation = conversation_store.create_conversation(x_session_id)
 
         conversation_id = conversation["id"]
         previous_history = [
@@ -417,7 +417,7 @@ async def chat(request: QueryRequest):
         # (important for step-gate confirmation detection when conversation_id is absent)
         effective_history = previous_history if previous_history else (request.conversation_history or [])
 
-        conversation_store.append_message(conversation_id, "user", request.query)
+        conversation_store.append_message(x_session_id, conversation_id, "user", request.query)
         
         # Process query through RAG pipeline
         result = pipeline.process_query(
@@ -453,8 +453,8 @@ async def chat(request: QueryRequest):
             "debugLogs": result.get("debug_logs", []),
         }
         
-        conversation_store.append_message(conversation_id, "assistant", answer_text, metadata=assistant_metadata)
-        conversation = conversation_store.refresh_summary(conversation_id)
+        conversation_store.append_message(x_session_id, conversation_id, "assistant", answer_text, metadata=assistant_metadata)
+        conversation = conversation_store.refresh_summary(x_session_id, conversation_id)
         
         # Get detected language (RAG returns 'language' field, not 'detected_language')
         detected_lang = result.get("detected_language", result.get("language", "unknown"))
@@ -603,30 +603,30 @@ async def source_preview(
 
 
 @app.get("/api/conversations", response_model=ConversationListResponse)
-async def list_conversations():
-    conversations = conversation_store.list_conversations()
+async def list_conversations(x_session_id: str = Header(default="anonymous-session")):
+    conversations = conversation_store.list_conversations(x_session_id)
     return {"conversations": [{**conversation, "messages": []} for conversation in conversations]}
 
 
 @app.post("/api/conversations", response_model=ConversationResponse)
-async def create_conversation(request: ConversationCreateRequest):
-    conversation = conversation_store.create_conversation(request.title)
+async def create_conversation(request: ConversationCreateRequest, x_session_id: str = Header(default="anonymous-session")):
+    conversation = conversation_store.create_conversation(x_session_id, request.title)
     return conversation
 
 
 @app.get("/api/conversations/{conversation_id}", response_model=ConversationResponse)
-async def get_conversation(conversation_id: str):
+async def get_conversation(conversation_id: str, x_session_id: str = Header(default="anonymous-session")):
     try:
-        conversation = conversation_store.refresh_summary(conversation_id)
+        conversation = conversation_store.refresh_summary(x_session_id, conversation_id)
         return conversation
     except KeyError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
 
 
 @app.delete("/api/conversations/{conversation_id}")
-async def delete_conversation(conversation_id: str):
+async def delete_conversation(conversation_id: str, x_session_id: str = Header(default="anonymous-session")):
     try:
-        conversation_store.delete_conversation(conversation_id)
+        conversation_store.delete_conversation(x_session_id, conversation_id)
         return {"success": True, "conversation_id": conversation_id}
     except KeyError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error

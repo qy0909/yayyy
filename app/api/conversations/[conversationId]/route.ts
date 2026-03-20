@@ -1,4 +1,4 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import http from 'http';
 import https from 'https';
 
@@ -10,7 +10,7 @@ type PythonApiResponse = {
   data: unknown;
 };
 
-function callPythonApi(path: string, method: 'GET' | 'DELETE'): Promise<PythonApiResponse> {
+function callPythonApi(path: string, method: 'GET' | 'DELETE', sessionId?: string): Promise<PythonApiResponse> {
   const baseUrl = new URL(PYTHON_API_URL);
   const isHttps = baseUrl.protocol === 'https:';
   const client = isHttps ? https : http;
@@ -24,6 +24,10 @@ function callPythonApi(path: string, method: 'GET' | 'DELETE'): Promise<PythonAp
         port: baseUrl.port || (isHttps ? 443 : 80),
         path: requestPath,
         method,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-session-id': sessionId || 'anonymous-session',
+        },
       },
       (res) => {
         const chunks: Buffer[] = [];
@@ -51,48 +55,24 @@ function callPythonApi(path: string, method: 'GET' | 'DELETE'): Promise<PythonAp
   });
 }
 
-type RouteContext = {
-  params: Promise<{
-    conversationId: string;
-  }>;
-};
-
-export async function GET(_: Request, context: RouteContext) {
-  try {
-    const { conversationId } = await context.params;
-    const response = await callPythonApi(`/api/conversations/${conversationId}`, 'GET');
-
-    if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Python API returned ${response.status}`);
-    }
-
-    return NextResponse.json(response.data);
-  } catch (error) {
-    return NextResponse.json(
-      {
-        error: error instanceof Error ? error.message : 'Failed to load conversation',
-      },
-      { status: 500 }
-    );
+export async function GET(request: NextRequest, props: { params: Promise<{ conversationId: string }> }) {
+  const params = await props.params;
+  if (!params.conversationId || params.conversationId === 'undefined' || params.conversationId === 'null') {
+    return NextResponse.json({ error: 'Invalid conversation ID' }, { status: 400 });
   }
+  
+  const sessionId = request.headers.get('x-session-id') || 'anonymous-session';
+  const response = await callPythonApi(`/api/conversations/${params.conversationId}`, 'GET', sessionId);
+  return NextResponse.json(response.data, { status: response.status });
 }
 
-export async function DELETE(_: Request, context: RouteContext) {
-  try {
-    const { conversationId } = await context.params;
-    const response = await callPythonApi(`/api/conversations/${conversationId}`, 'DELETE');
-
-    if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Python API returned ${response.status}`);
-    }
-
-    return NextResponse.json(response.data);
-  } catch (error) {
-    return NextResponse.json(
-      {
-        error: error instanceof Error ? error.message : 'Failed to delete conversation',
-      },
-      { status: 500 }
-    );
+export async function DELETE(request: NextRequest, props: { params: Promise<{ conversationId: string }> }) {
+  const params = await props.params;
+  if (!params.conversationId || params.conversationId === 'undefined' || params.conversationId === 'null') {
+    return NextResponse.json({ error: 'Invalid conversation ID' }, { status: 400 });
   }
+
+  const sessionId = request.headers.get('x-session-id') || 'anonymous-session';
+  const response = await callPythonApi(`/api/conversations/${params.conversationId}`, 'DELETE', sessionId);
+  return NextResponse.json(response.data, { status: response.status });
 }

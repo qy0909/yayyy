@@ -1,9 +1,9 @@
 import os
-import sqlite3
-import threading
+import json
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from supabase import create_client, Client
 
 
 MAX_SUMMARY_LINES = 8
@@ -11,190 +11,117 @@ SUMMARY_KEEP_RECENT_MESSAGES = 6
 
 
 class ConversationStore:
-    """SQLite-backed conversation persistence with rolling summaries."""
+    """Supabase-backed conversation persistence with rolling summaries."""
 
-    def __init__(self, db_path: Optional[str] = None):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.db_path = db_path or os.path.join(base_dir, "conversations.db")
-        self._lock = threading.Lock()
-        self._init_db()
+    def __init__(self):
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_KEY")
+        if not supabase_url or not supabase_key:
+            raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in .env")
+        self.supabase: Client = create_client(supabase_url, supabase_key)
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        return connection
-
-    def _init_db(self) -> None:
-        with self._connect() as connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS conversations (
-                    id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    summary TEXT NOT NULL DEFAULT '',
-                    summary_message_count INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    conversation_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    text TEXT NOT NULL,
-                    metadata TEXT DEFAULT '{}',
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-                );
-                """
-            )
-            
-            # Migration: Add metadata column if it doesn't exist (for existing databases)
-            try:
-                connection.execute("SELECT metadata FROM messages LIMIT 1")
-            except sqlite3.OperationalError:
-                connection.execute("ALTER TABLE messages ADD COLUMN metadata TEXT DEFAULT '{}'")
-                connection.commit()
-
-    def create_conversation(self, title: Optional[str] = None) -> Dict[str, Any]:
+    def create_conversation(self, session_id: str, title: Optional[str] = None) -> Dict[str, Any]:
         conversation_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
         safe_title = (title or "New conversation").strip() or "New conversation"
 
-        with self._lock, self._connect() as connection:
-            connection.execute(
-                "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                (conversation_id, safe_title[:120], now, now),
-            )
+        data = {
+            "id": conversation_id,
+            "session_id": session_id,
+            "title": safe_title[:120],
+            "summary": "",
+            "created_at": now,
+            "updated_at": now
+        }
+        
+        self.supabase.table("conversations").insert(data).execute()
+        return self.get_conversation(session_id, conversation_id)
 
-        return self.get_conversation(conversation_id)
+    def list_conversations(self, session_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        query = (
+            self.supabase.table("conversations")
+            .select("id, title, summary, created_at, updated_at")
+            .eq("session_id", session_id)
+            .order("updated_at", desc=True)
+        )
+        if limit is not None:
+            query = query.limit(limit)
+            
+        response = query.execute()
+        return response.data or []
 
-    def list_conversations(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        with self._connect() as connection:
-            if limit is None:
-                rows = connection.execute(
-                    """
-                    SELECT id, title, summary, created_at, updated_at
-                    FROM conversations
-                    ORDER BY updated_at DESC
-                    """
-                ).fetchall()
-            else:
-                rows = connection.execute(
-                    """
-                    SELECT id, title, summary, created_at, updated_at
-                    FROM conversations
-                    ORDER BY updated_at DESC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
+    def delete_conversation(self, session_id: str, conversation_id: str) -> None:
+        # messages delete cascaded by Supabase FK relation
+        self.supabase.table("conversations").delete().eq("id", conversation_id).eq("session_id", session_id).execute()
 
-        return [dict(row) for row in rows]
+    def get_conversation(self, session_id: str, conversation_id: str) -> Dict[str, Any]:
+        conv_response = self.supabase.table("conversations").select("*").eq("id", conversation_id).eq("session_id", session_id).execute()
+        if not conv_response.data:
+            raise KeyError(f"Conversation not found: {conversation_id}")
 
-    def delete_conversation(self, conversation_id: str) -> None:
-        with self._lock, self._connect() as connection:
-            existing = connection.execute(
-                "SELECT id FROM conversations WHERE id = ?",
-                (conversation_id,),
-            ).fetchone()
-            if existing is None:
-                raise KeyError(f"Conversation not found: {conversation_id}")
-
-            connection.execute(
-                "DELETE FROM messages WHERE conversation_id = ?",
-                (conversation_id,),
-            )
-            connection.execute(
-                "DELETE FROM conversations WHERE id = ?",
-                (conversation_id,),
-            )
-
-    def get_conversation(self, conversation_id: str) -> Dict[str, Any]:
-        import json
-        with self._connect() as connection:
-            conversation = connection.execute(
-                "SELECT id, title, summary, summary_message_count, created_at, updated_at FROM conversations WHERE id = ?",
-                (conversation_id,),
-            ).fetchone()
-            if conversation is None:
-                raise KeyError(f"Conversation not found: {conversation_id}")
-
-            messages = connection.execute(
-                "SELECT role, text, metadata, created_at FROM messages WHERE conversation_id = ? ORDER BY id ASC",
-                (conversation_id,),
-            ).fetchall()
+        conversation = conv_response.data[0]
+        
+        msg_response = self.supabase.table("messages").select("role, text, metadata, created_at").eq("conversation_id", conversation_id).order("id", desc=False).execute()
+        messages = msg_response.data or []
 
         payload = dict(conversation)
         payload["messages"] = []
         
         for message in messages:
             msg_dict = dict(message)
-            metadata_str = msg_dict.get("metadata")
+            metadata = msg_dict.pop("metadata", {})
             
-            # Parse metadata JSON if it exists
-            if metadata_str:
+            if isinstance(metadata, str):
                 try:
-                    metadata = json.loads(metadata_str)
-                    # Merge metadata fields into the message
-                    for key, value in metadata.items():
-                        msg_dict[key] = value
-                except (json.JSONDecodeError, TypeError) as e:
-                    pass
+                    metadata = json.loads(metadata)
+                except json.JSONDecodeError:
+                    metadata = {}
             
-            # Remove the raw metadata field since it's merged into the message
-            msg_dict.pop("metadata", None)
+            if metadata:
+                for key, value in metadata.items():
+                    msg_dict[key] = value
+                    
             payload["messages"].append(msg_dict)
             
         return payload
 
     def get_recent_messages(self, conversation_id: str, limit: int = SUMMARY_KEEP_RECENT_MESSAGES) -> List[Dict[str, str]]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT role, text
-                FROM messages
-                WHERE conversation_id = ?
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (conversation_id, limit),
-            ).fetchall()
+        response = self.supabase.table("messages").select("role, text").eq("conversation_id", conversation_id).order("id", desc=True).limit(limit).execute()
+        rows = response.data or []
+        return list(reversed(rows))
 
-        return [dict(row) for row in reversed(rows)]
-
-    def append_message(self, conversation_id: str, role: str, text: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        import json
+    def append_message(self, session_id: str, conversation_id: str, role: str, text: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         message_text = (text or "").strip()
         if not message_text:
             return
 
         now = datetime.now().isoformat()
-        metadata_json = json.dumps(metadata or {})
         
-        with self._lock, self._connect() as connection:
-            connection.execute(
-                "INSERT INTO messages (conversation_id, role, text, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
-                (conversation_id, role, message_text, metadata_json, now),
-            )
-            conversation = connection.execute(
-                "SELECT title FROM conversations WHERE id = ?",
-                (conversation_id,),
-            ).fetchone()
-            if conversation is None:
-                raise KeyError(f"Conversation not found: {conversation_id}")
+        # Verify conversation belongs to user
+        conv_resp = self.supabase.table("conversations").select("title").eq("id", conversation_id).eq("session_id", session_id).execute()
+        if not conv_resp.data:
+            raise KeyError(f"Conversation not found: {conversation_id}")
 
-            title = conversation["title"]
-            if title == "New conversation" and role == "user":
-                title = self._derive_title(message_text)
+        msg_data = {
+            "conversation_id": conversation_id,
+            "role": role,
+            "text": message_text,
+            "metadata": metadata or {},
+            "created_at": now
+        }
+        self.supabase.table("messages").insert(msg_data).execute()
+        
+        title = conv_resp.data[0]["title"]
+        if title == "New conversation" and role == "user":
+            title = self._derive_title(message_text)
 
-            connection.execute(
-                "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
-                (title, now, conversation_id),
-            )
+        self.supabase.table("conversations").update({
+            "title": title,
+            "updated_at": now
+        }).eq("id", conversation_id).execute()
 
-    def refresh_summary(self, conversation_id: str) -> Dict[str, Any]:
-        conversation = self.get_conversation(conversation_id)
+    def refresh_summary(self, session_id: str, conversation_id: str) -> Dict[str, Any]:
+        conversation = self.get_conversation(session_id, conversation_id)
         messages = conversation["messages"]
         summary_cutoff = max(0, len(messages) - SUMMARY_KEEP_RECENT_MESSAGES)
 
@@ -206,13 +133,13 @@ class ConversationStore:
             summary_message_count = summary_cutoff
 
         now = datetime.now().isoformat()
-        with self._lock, self._connect() as connection:
-            connection.execute(
-                "UPDATE conversations SET summary = ?, summary_message_count = ?, updated_at = ? WHERE id = ?",
-                (summary, summary_message_count, now, conversation_id),
-            )
+        self.supabase.table("conversations").update({
+            "summary": summary,
+            "summary_message_count": summary_message_count,
+            "updated_at": now
+        }).eq("id", conversation_id).eq("session_id", session_id).execute()
 
-        return self.get_conversation(conversation_id)
+        return self.get_conversation(session_id, conversation_id)
 
     def _derive_title(self, text: str) -> str:
         title = " ".join(text.split())
