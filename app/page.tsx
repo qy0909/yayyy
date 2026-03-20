@@ -2,9 +2,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Mic, Send, Volume2, HeartPulse, Scale, 
-  ShieldCheck, History, Menu, X, PlusCircle, 
-  ExternalLink, FileText, Search, Loader2, Trash2, BookOpen
+  ShieldCheck, History, Menu, X, PlusCircle,
+  ExternalLink, FileText, Search, Loader2, Trash2, BookOpen, Download
 } from 'lucide-react';
+import { jsPDF } from 'jspdf';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -85,8 +86,6 @@ type ChatMessage = {
   detectedLanguage?: string;
   debugLogs?: string[];
   queryExpansions?: Array<{ phrase?: string; expansion?: string; dialect?: string; language_code?: string }>;
-  originalText?: string;
-  isSimplifying?: boolean;
 };
 
 type ChatHistoryItem = {
@@ -198,6 +197,38 @@ const splitEvidenceByCitationUsage = (evidence: EvidenceItem[] = []) => {
   return { cited, additional };
 };
 
+const normalizePdfLine = (line: string) =>
+  line
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1 ($2)')
+    .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1')
+    .replace(/_([^_]+)_/g, '$1')
+    .replace(/^#{1,6}\s*/g, '')
+    .replace(/^\>\s?/g, '')
+    .replace(/^\s*[-*+]\s+/g, '- ')
+    .replace(/^\s*\d+\.\s+/g, (match) => match.trim())
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const softenLongTokens = (line: string) =>
+  line
+    .replace(/(https?:\/\/[^\s]+)/g, (url) =>
+      url.replace(/([/?=&_.:#-])/g, '$1 ')
+    )
+    .replace(/([A-Za-z0-9])(\[)/g, '$1 $2')
+    .replace(/([\]\)])([A-Za-z0-9])/g, '$1 $2')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const formatTextForPdf = (text: string) =>
+  text
+    .split(/\r?\n/)
+    .map((line) => softenLongTokens(normalizePdfLine(line)))
+    .filter((line, index, lines) => line.length > 0 || (index > 0 && lines[index - 1].length > 0));
+
 export default function InclusiveApp() {
   const [input, setInput] = useState("");
   const [language, setLanguage] = useState("ms-MY");
@@ -258,6 +289,86 @@ export default function InclusiveApp() {
     setPreviewLoading(false);
     setPreviewError(null);
     previewChunkRefs.current = {};
+  };
+
+  const exportChatHistoryToPdf = () => {
+    const printableMessages = messages.filter((message) => message.text?.trim());
+    if (printableMessages.length === 0) {
+      window.alert('There is no chat history to export yet.');
+      return;
+    }
+
+    const activeConversation = conversations.find((conversation) => conversation.id === currentConversationId);
+    const conversationTitle = activeConversation?.title?.trim() || 'Chat History';
+    const generatedAt = new Date().toLocaleString();
+    const doc = new jsPDF({
+      orientation: 'p',
+      unit: 'pt',
+      format: 'a4',
+    });
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const marginX = 48;
+    const marginTop = 56;
+    const marginBottom = 48;
+    const contentWidth = pageWidth - marginX * 2;
+    const safeTitle = conversationTitle.replace(/[\\/:*?"<>|]+/g, '-');
+    let cursorY = marginTop;
+
+    const ensureSpace = (requiredHeight: number) => {
+      if (cursorY + requiredHeight <= pageHeight - marginBottom) {
+        return;
+      }
+      doc.addPage();
+      cursorY = marginTop;
+    };
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(22);
+    doc.text(conversationTitle, marginX, cursorY);
+    cursorY += 24;
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(11);
+    doc.setTextColor(100, 116, 139);
+    doc.text(`Exported from SuaraGov on ${generatedAt}`, marginX, cursorY);
+    cursorY += 28;
+
+    printableMessages.forEach((message) => {
+      const roleLabel = message.role === 'user' ? 'You' : 'SuaraGov';
+      const formattedParagraphs = formatTextForPdf(message.text);
+      const bodyLines = formattedParagraphs.flatMap((paragraph, index) => {
+        if (!paragraph) {
+          return index === formattedParagraphs.length - 1 ? [''] : ['', ''];
+        }
+        return doc.splitTextToSize(paragraph, contentWidth - 24) as string[];
+      });
+      const lineHeight = 16;
+      const bubbleHeight = Math.max(44, bodyLines.length * lineHeight + 24);
+
+      ensureSpace(24 + bubbleHeight + 20);
+
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(10);
+      doc.setTextColor(100, 116, 139);
+      doc.text(roleLabel.toUpperCase(), marginX, cursorY);
+      cursorY += 12;
+
+      const fillColor = message.role === 'user' ? [220, 252, 231] : [248, 250, 252];
+      const borderColor = message.role === 'user' ? [134, 239, 172] : [226, 232, 240];
+      doc.setFillColor(fillColor[0], fillColor[1], fillColor[2]);
+      doc.setDrawColor(borderColor[0], borderColor[1], borderColor[2]);
+      doc.roundedRect(marginX, cursorY, contentWidth, bubbleHeight, 14, 14, 'FD');
+
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(11);
+      doc.setTextColor(15, 23, 42);
+      doc.text(bodyLines, marginX + 12, cursorY + 18);
+
+      cursorY += bubbleHeight + 18;
+    });
+
+    doc.save(`${safeTitle || 'chat-history'}.pdf`);
   };
 
   const openReconstructedPreview = async (source: SourceItem, messageIndex: number) => {
@@ -599,62 +710,6 @@ export default function InclusiveApp() {
     }
   };
 
-  const handleSimplify = async (messageIndex: number, text: string) => {
-    // Set loading state for this message
-    const newMessages = messages.map((m, i) => {
-        if (i === messageIndex) {
-            return { ...m, isSimplifying: true };
-        }
-        return m;
-    });
-    setMessages(newMessages);
-
-    try {
-        const response = await fetch('/api/simplify', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text }),
-        });
-        const result = await response.json();
-
-        if (result.success) {
-            const updatedMessages = messages.map((m, i) => {
-                if (i === messageIndex) {
-                    return {
-                        ...m,
-                        text: result.simplified_text,
-                        originalText: m.text, // Store original text
-                        isSimplifying: false,
-                    };
-                }
-                return m;
-            });
-            setMessages(updatedMessages);
-        } else {
-            // Handle error - maybe show a toast notification
-            console.error("Simplification failed:", result.error);
-            // Revert loading state
-            const revertedMessages = messages.map((m, i) => {
-                if (i === messageIndex) {
-                    return { ...m, isSimplifying: false };
-                }
-                return m;
-            });
-            setMessages(revertedMessages);
-        }
-    } catch (error) {
-        console.error("Simplification failed:", error);
-        // Revert loading state
-        const revertedMessages = messages.map((m, i) => {
-            if (i === messageIndex) {
-                return { ...m, isSimplifying: false };
-            }
-            return m;
-        });
-        setMessages(revertedMessages);
-    }
-  };
-
   const handleSend = async (overrideInput?: string) => {
     const textToSend = overrideInput || input;
     if (!textToSend) return;
@@ -985,6 +1040,16 @@ export default function InclusiveApp() {
                 {warmupStatus === 'failed' ? 'Model warmup failed' : 'Warming up model...'}
               </div>
             )}
+            <button
+              type="button"
+              onClick={exportChatHistoryToPdf}
+              disabled={messages.length === 0}
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-bold transition-all border bg-slate-100 text-slate-600 border-slate-200 hover:bg-emerald-50 hover:border-emerald-300 disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Export current chat history to PDF"
+            >
+              <Download size={16} />
+              Export PDF
+            </button>
             {/* Inclusive Dictionary Toggle */}
             <button 
               onClick={() => setShowDictionaryPanel(!showDictionaryPanel)}
@@ -1036,7 +1101,7 @@ export default function InclusiveApp() {
                   </div>
                 )}
 
-                <div className="prose prose-lg max-w-none text-base lg:text-lg leading-relaxed font-medium">
+                <div className="prose prose-lg max-w-none font-sans text-base lg:text-lg leading-relaxed font-medium">
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>
                     {m.text}
                   </ReactMarkdown>
@@ -1097,7 +1162,7 @@ export default function InclusiveApp() {
                                     )}
                                   </span>
                                 </div>
-                                <p className="text-[11px] text-slate-600 italic leading-relaxed line-clamp-4">
+                                <p className="font-sans text-[11px] text-slate-600 italic leading-relaxed line-clamp-4">
                                   &ldquo;{ev.original_excerpt}&rdquo;
                                 </p>
                                 <button
@@ -1139,7 +1204,7 @@ export default function InclusiveApp() {
                                     <span className="ml-1 text-slate-400">· not cited</span>
                                   </span>
                                 </div>
-                                <p className="text-[11px] text-slate-600 italic leading-relaxed line-clamp-3">
+                                <p className="font-sans text-[11px] text-slate-600 italic leading-relaxed line-clamp-3">
                                   &ldquo;{ev.original_excerpt}&rdquo;
                                 </p>
                                 <button
@@ -1240,36 +1305,6 @@ export default function InclusiveApp() {
                           </>
                         )}
                       </button>
-                      <button 
-                        onClick={() => {
-                          if (m.originalText) {
-                            // If already simplified, revert to original
-                            const updatedMessages = messages.map((msg, index) => {
-                              if (index === i) {
-                                return { ...msg, text: msg.originalText ?? msg.text, originalText: undefined };
-                              }
-                              return msg;
-                            });
-                            setMessages(updatedMessages);
-                          } else {
-                            handleSimplify(i, m.text)
-                          }
-                        }}
-                        disabled={m.isSimplifying}
-                        className="flex items-center gap-2 bg-white border border-slate-200 text-slate-700 px-5 py-2.5 rounded-full text-sm font-bold hover:border-emerald-500 transition-all shadow-sm"
-                      >
-                        {m.isSimplifying ? (
-                          <>
-                            <Loader2 size={18} className="animate-spin" />
-                            Simplifying...
-                          </>
-                        ) : (
-                          <>
-                            <PlusCircle size={18} />
-                            {m.originalText ? 'Show Original' : 'Simpler Version'}
-                          </>
-                        )}
-                      </button>
                     </div>
                   </div>
                 )}
@@ -1364,7 +1399,7 @@ export default function InclusiveApp() {
                       : 'bg-white text-emerald-600 shadow-sm hover:bg-emerald-50'
                 }`}
               >
-                {isListening ? <X size={24} /> : <Mic size={24} />}
+                {isListening ? <X size={20} /> : <Mic size={20} />}
               </button>
               
               <textarea 
@@ -1374,7 +1409,7 @@ export default function InclusiveApp() {
                 onChange={(e) => setInput(e.target.value)} 
                 onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSend())}
                 placeholder={isListening ? "" : "Ask me anything..."} 
-                className={`flex-1 bg-transparent border-none focus:ring-0 text-slate-800 py-3 sm:py-4 text-base sm:text-lg resize-none max-h-32 transition-opacity ${isTranscribing ? 'opacity-0' : 'opacity-100'}`}
+                className={`flex-1 bg-transparent border-none focus:ring-0 text-slate-800 py-2.5 sm:py-3 text-sm sm:text-base resize-none max-h-28 transition-opacity ${isTranscribing ? 'opacity-0' : 'opacity-100'}`}
               />
 
               {/* SEND BUTTON */}
