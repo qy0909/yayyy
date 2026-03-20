@@ -10,7 +10,7 @@ type PythonApiResponse = {
   data: unknown;
 };
 
-function callPythonApi(path: string, method: 'GET' | 'POST', body?: unknown): Promise<PythonApiResponse> {
+function callPythonApi(path: string, method: 'PATCH', body?: unknown, headers?: Record<string, string>): Promise<PythonApiResponse> {
   const baseUrl = new URL(PYTHON_API_URL);
   const isHttps = baseUrl.protocol === 'https:';
   const client = isHttps ? https : http;
@@ -29,6 +29,7 @@ function callPythonApi(path: string, method: 'GET' | 'POST', body?: unknown): Pr
         headers: {
           'Content-Type': 'application/json',
           ...(payload ? { 'Content-Length': Buffer.byteLength(payload).toString() } : {}),
+          ...(headers || {}),
         },
       },
       (res) => {
@@ -68,65 +69,30 @@ function callPythonApi(path: string, method: 'GET' | 'POST', body?: unknown): Pr
   });
 }
 
-export async function POST(request: NextRequest) {
+export async function PATCH(
+  request: NextRequest,
+  { params }: { params: Promise<{ submissionId: string }> }
+) {
   try {
     const body = await request.json();
-    const { query, top_k = 5, summary_mode_enabled = null, conversation_id, conversation_history = [] } = body;
+    const { submissionId } = await params;
+    const adminToken = request.headers.get('x-admin-token') || '';
 
-    if (!query) {
-      return NextResponse.json(
-        { error: 'Query is required' },
-        { status: 400 }
-      );
-    }
+    const response = await callPythonApi(
+      `/api/slang-terms/submissions/${encodeURIComponent(submissionId)}/review`,
+      'PATCH',
+      body,
+      adminToken ? { 'x-admin-token': adminToken } : undefined
+    );
 
-    // Call Python FastAPI backend
-    const response = await callPythonApi('/api/chat', 'POST', {
-      query,
-      top_k,
-      summary_mode_enabled,
-      conversation_id,
-      conversation_history,
-    });
-
-    if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Python API returned ${response.status}`);
-    }
-
-    return NextResponse.json(response.data);
-
+    return NextResponse.json(response.data, { status: response.status });
   } catch (error) {
-    console.error('Error calling Python API:', error);
-    
     return NextResponse.json(
       {
         success: false,
-        error: error instanceof Error ? error.message : 'Failed to process query',
-        answer: 'Sorry, I encountered an error. Please make sure the Python backend is running.',
+        error: error instanceof Error ? error.message : 'Failed to review submission',
       },
       { status: 500 }
     );
-  }
-}
-
-export async function GET() {
-  try {
-    // Health check - ping Python backend
-    const response = await callPythonApi('/health', 'GET');
-
-    if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Python API returned ${response.status}`);
-    }
-    
-    return NextResponse.json({
-      status: 'ok',
-      backend: response.data,
-      message: 'Chat API is ready',
-    });
-  } catch (error) {
-    return NextResponse.json({
-      status: 'error',
-      message: 'Python backend is not responding. Make sure it\'s running on port 8000.',
-    }, { status: 503 });
   }
 }

@@ -8,17 +8,18 @@ import io
 import os
 import shutil
 import threading
+from datetime import datetime
 
 # Fix Unicode encoding for Windows console
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 import uvicorn
 from dotenv import load_dotenv
 from conversation_store import ConversationStore
@@ -85,6 +86,9 @@ warmup_state = {
     "status": "starting",  # starting | warming | ready | failed
     "error": None,
 }
+
+SLANG_DICTIONARY_TABLE = os.getenv("SLANG_DICTIONARY_TABLE", "community_dictionary")
+SLANG_REVIEW_ADMIN_TOKEN = os.getenv("SLANG_REVIEW_ADMIN_TOKEN", "")
 
 def get_rag_pipeline():
     """Lazy load RAG pipeline on first use"""
@@ -158,6 +162,7 @@ class QueryRequest(BaseModel):
     query: str
     user_language: Optional[str] = None  # If user wants to specify language
     top_k: Optional[int] = 5
+    summary_mode_enabled: Optional[bool] = None
     conversation_id: Optional[str] = None
     conversation_history: Optional[List[Dict[str, str]]] = None
     
@@ -189,6 +194,10 @@ class QueryResponse(BaseModel):
     rag_used: Optional[bool] = None
     summary_mode: Optional[bool] = None
     summary_mode_reason: Optional[str] = None
+    query_expansions: Optional[List[Dict[str, Any]]] = None
+    used_citation_tags: Optional[List[str]] = None
+    unused_citation_tags: Optional[List[str]] = None
+    citation_stats: Optional[Dict[str, Any]] = None
     processing_time: float
     conversation_id: str
     conversation_title: Optional[str] = None
@@ -213,6 +222,10 @@ class ConversationMessage(BaseModel):
     ragUsed: Optional[bool] = None
     summaryMode: Optional[bool] = None
     summaryModeReason: Optional[str] = None
+    queryExpansions: Optional[List[Dict[str, Any]]] = None
+    usedCitationTags: Optional[List[str]] = None
+    unusedCitationTags: Optional[List[str]] = None
+    citationStats: Optional[Dict[str, Any]] = None
     status: Optional[str] = None
     debugLogs: Optional[List[str]] = None
     
@@ -266,6 +279,43 @@ class HealthResponse(BaseModel):
     warmup_status: str
     warmup_error: Optional[str] = None
     message: str
+
+
+class SlangSubmissionRequest(BaseModel):
+    phrase: str
+    meaning: str
+    normalized_form: Optional[str] = None
+    dialect: Optional[str] = None
+    language_code: Optional[str] = None
+    region: Optional[str] = None
+    example_sentence: Optional[str] = None
+    contributor_note: Optional[str] = None
+
+
+class SlangReviewRequest(BaseModel):
+    status: Literal["approved", "rejected"]
+    reviewer_note: Optional[str] = None
+    reviewer_id: Optional[str] = None
+
+
+def _validate_slang_submission(payload: SlangSubmissionRequest) -> None:
+    if len(payload.phrase.strip()) < 2:
+        raise HTTPException(status_code=400, detail="phrase must be at least 2 characters")
+    if len(payload.meaning.strip()) < 2:
+        raise HTTPException(status_code=400, detail="meaning must be at least 2 characters")
+
+
+def _require_admin_review_access(request: Request) -> None:
+    configured_token = SLANG_REVIEW_ADMIN_TOKEN.strip()
+    if not configured_token:
+        raise HTTPException(
+            status_code=503,
+            detail="Review access is disabled until SLANG_REVIEW_ADMIN_TOKEN is configured",
+        )
+
+    provided_token = (request.headers.get("x-admin-token") or "").strip()
+    if provided_token != configured_token:
+        raise HTTPException(status_code=401, detail="Unauthorized reviewer token")
 
 
 # ============================================================================
@@ -373,6 +423,8 @@ async def chat(request: QueryRequest):
         result = pipeline.process_query(
             user_query=request.query,
             user_language_hint=request.user_language,
+            top_k=request.top_k,
+            summary_mode_enabled=request.summary_mode_enabled,
             conversation_history=effective_history,
             conversation_summary=conversation.get("summary", ""),
         )
@@ -393,6 +445,10 @@ async def chat(request: QueryRequest):
             "ragUsed": result.get("rag_used", True),
             "summaryMode": result.get("summary_mode", False),
             "summaryModeReason": result.get("summary_mode_reason"),
+            "queryExpansions": result.get("query_expansions", []),
+            "usedCitationTags": result.get("used_citation_tags", []),
+            "unusedCitationTags": result.get("unused_citation_tags", []),
+            "citationStats": result.get("citation_stats", {}),
             "status": result.get("status", "unknown"),
             "debugLogs": result.get("debug_logs", []),
         }
@@ -417,6 +473,10 @@ async def chat(request: QueryRequest):
             "rag_used": result.get("rag_used", True),
             "summary_mode": result.get("summary_mode", False),
             "summary_mode_reason": result.get("summary_mode_reason"),
+            "query_expansions": result.get("query_expansions", []),
+            "used_citation_tags": result.get("used_citation_tags", []),
+            "unused_citation_tags": result.get("unused_citation_tags", []),
+            "citation_stats": result.get("citation_stats", {}),
             "processing_time": round(processing_time, 2),
             "conversation_id": conversation_id,
             "conversation_title": conversation.get("title"),
@@ -438,6 +498,7 @@ async def chat(request: QueryRequest):
             "detected_language": "unknown",
             "answer": "",
             "sources": [],
+            "query_expansions": [],
             "processing_time": round(processing_time, 2),
             "conversation_id": request.conversation_id or "",
             "conversation_title": None,
@@ -683,6 +744,130 @@ async def supported_languages():
             {"code": "tl", "name": "Tagalog"},
             {"code": "id", "name": "Indonesian"}
         ]
+    }
+
+
+@app.post("/api/slang-terms/submissions")
+async def submit_slang_term(payload: SlangSubmissionRequest):
+    """Collect community slang/local expressions for moderation."""
+    _validate_slang_submission(payload)
+
+    pipeline = get_rag_pipeline()
+    row = {
+        "phrase": payload.phrase.strip(),
+        "meaning": payload.meaning.strip(),
+        "normalized_form": (payload.normalized_form or payload.meaning).strip(),
+        "dialect": (payload.dialect or "").strip() or None,
+        "language_code": (payload.language_code or "").strip() or None,
+        "region": (payload.region or "").strip() or None,
+        "example_sentence": (payload.example_sentence or "").strip() or None,
+        "contributor_note": (payload.contributor_note or "").strip() or None,
+        "status": "pending",
+        "is_active": True,
+        "vote_count": 0,
+    }
+
+    try:
+        response = (
+            pipeline.supabase_client
+            .table(SLANG_DICTIONARY_TABLE)
+            .insert(row)
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Failed to store slang submission in table '{SLANG_DICTIONARY_TABLE}'. "
+                f"Create the table and retry. Error: {e}"
+            ),
+        )
+
+    inserted = (response.data or [{}])[0]
+    return {
+        "success": True,
+        "message": "Submission received and queued for review",
+        "submission": inserted,
+    }
+
+
+@app.get("/api/slang-terms")
+async def list_slang_terms(
+    request: Request,
+    status: str = Query("approved", pattern="^(pending|approved|rejected)$"),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """List slang terms. Pending/rejected require admin token."""
+    if status != "approved":
+        _require_admin_review_access(request)
+
+    pipeline = get_rag_pipeline()
+    try:
+        response = (
+            pipeline.supabase_client
+            .table(SLANG_DICTIONARY_TABLE)
+            .select("*")
+            .eq("status", status)
+            .eq("is_active", True)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Failed to fetch slang terms from table '{SLANG_DICTIONARY_TABLE}'. "
+                f"Error: {e}"
+            ),
+        )
+
+    return {
+        "success": True,
+        "status": status,
+        "count": len(response.data or []),
+        "terms": response.data or [],
+    }
+
+
+@app.patch("/api/slang-terms/submissions/{submission_id}/review")
+async def review_slang_submission(
+    submission_id: str,
+    payload: SlangReviewRequest,
+    request: Request,
+):
+    """Approve/reject crowdsourced entries for safe integration into retrieval."""
+    _require_admin_review_access(request)
+
+    pipeline = get_rag_pipeline()
+    review_update = {
+        "status": payload.status,
+        "reviewer_note": (payload.reviewer_note or "").strip() or None,
+        "reviewed_by": (payload.reviewer_id or "").strip() or "admin",
+        "reviewed_at": datetime.now().isoformat(),
+    }
+
+    try:
+        response = (
+            pipeline.supabase_client
+            .table(SLANG_DICTIONARY_TABLE)
+            .update(review_update)
+            .eq("id", submission_id)
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to review submission '{submission_id}': {e}",
+        )
+
+    if not response.data:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    return {
+        "success": True,
+        "message": f"Submission {submission_id} marked as {payload.status}",
+        "submission": response.data[0],
     }
 
 

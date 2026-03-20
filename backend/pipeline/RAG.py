@@ -12,7 +12,7 @@ This pipeline handles user queries through:
 import os
 import re
 import unicodedata
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import json
 import time
 import threading
@@ -182,6 +182,8 @@ TOP_K_RESULTS = int(os.getenv('TOP_K_RESULTS', '6'))
 VECTOR_CANDIDATE_MULTIPLIER = int(os.getenv('VECTOR_CANDIDATE_MULTIPLIER', '10'))
 # Increased from 10 to 40 for minimum candidate threshold
 VECTOR_MIN_CANDIDATES = int(os.getenv('VECTOR_MIN_CANDIDATES', '40'))
+# Hard ceiling to prevent unbounded retrieval latency on broad queries.
+VECTOR_MAX_CANDIDATES = int(os.getenv('VECTOR_MAX_CANDIDATES', '120'))
 
 # Quality filters to avoid tiny chunks like single-word headings.
 MIN_RETRIEVED_CHUNK_CHARS = int(os.getenv('MIN_RETRIEVED_CHUNK_CHARS', '60'))
@@ -193,6 +195,14 @@ EMBEDDINGS_TABLE_NAME = 'embeddings'
 
 # Supabase table name for labour office directory lookup
 LABOUR_OFFICES_TABLE_NAME = os.getenv('LABOUR_OFFICES_TABLE_NAME', 'labour_offices')
+
+# Supabase table name for community-submitted local phrases/slang.
+SLANG_DICTIONARY_TABLE_NAME = os.getenv('SLANG_DICTIONARY_TABLE', 'community_dictionary')
+
+# Query expansion settings for approved local phrase entries.
+ENABLE_SLANG_QUERY_EXPANSION = os.getenv('ENABLE_SLANG_QUERY_EXPANSION', 'true').lower() in {'1', 'true', 'yes'}
+SLANG_TERMS_CACHE_TTL_SECONDS = int(os.getenv('SLANG_TERMS_CACHE_TTL_SECONDS', '300'))
+SLANG_MAX_TERMS_PER_QUERY = int(os.getenv('SLANG_MAX_TERMS_PER_QUERY', '5'))
 
 # Similarity threshold (0-1, higher = more strict)
 SIMILARITY_THRESHOLD = 0.15
@@ -214,6 +224,12 @@ RESPONSE_DEPTH = os.getenv('RESPONSE_DEPTH', 'balanced').lower()
 
 # Set true to always end with a follow-up question.
 FORCE_FOLLOW_UP_QUESTION = os.getenv('FORCE_FOLLOW_UP_QUESTION', 'true').lower() in {'1', 'true', 'yes'}
+
+# Controls follow-up behavior:
+# - adaptive: choose follow-up based on response type
+# - fixed: keep legacy "next step" follow-up
+# - off: disable automatic follow-up
+FOLLOW_UP_STYLE = os.getenv('FOLLOW_UP_STYLE', 'adaptive').strip().lower()
 
 # Step-gating can add one extra turn; keep it off by default for direct guidance.
 ENABLE_STEP_GATE = os.getenv('ENABLE_STEP_GATE', 'false').lower() in {'1', 'true', 'yes'}
@@ -551,6 +567,9 @@ class RAGPipeline:
         # Initialize Supabase client
         print(f"🗄️  Connecting to Supabase...")
         self.supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        self.slang_terms_cache: List[Dict[str, Any]] = []
+        self.slang_terms_cache_loaded_at = 0.0
+        self.last_query_expansions: List[Dict[str, str]] = []
         print(f"🧠 Active LLM configured: {self._describe_active_llm(provider)}")
         
         print("✅ RAG Pipeline initialized successfully!\n")
@@ -995,7 +1014,50 @@ class RAGPipeline:
     # STEP 3: VECTOR SEARCH IN SUPABASE
     # ========================================================================
     
-    def vector_search(self, query_embedding: List[float]) -> List[Dict[str, Any]]:
+    def _compute_retrieval_budget(self, user_query: str, requested_top_k: Optional[int] = None) -> Dict[str, int]:
+        """Compute adaptive retrieval budget so broad queries can retrieve richer context."""
+        if isinstance(requested_top_k, int) and requested_top_k > 0:
+            base_top_k = requested_top_k
+        else:
+            base_top_k = TOP_K_RESULTS
+
+        base_top_k = max(3, min(base_top_k, 12))
+
+        normalized_query = (user_query or '').lower().strip()
+        word_count = len(re.findall(r"[A-Za-zÀ-ÿ0-9']+", normalized_query))
+
+        broad_query_terms = {
+            'all', 'overall', 'complete', 'everything', 'compare', 'difference',
+            'options', 'types', 'requirements', 'documents', 'procedure', 'steps',
+            'benefits', 'rights', 'policy', 'policies', 'eligibility',
+            'keseluruhan', 'semua', 'syarat', 'dokumen', 'langkah', 'prosedur',
+            'penuh', 'lengkap', 'semuanya',
+        }
+
+        is_broad_query = (
+            word_count >= 10
+            or any(term in normalized_query for term in broad_query_terms)
+        )
+
+        effective_top_k = min(base_top_k + 2, 12) if is_broad_query else base_top_k
+        effective_multiplier = VECTOR_CANDIDATE_MULTIPLIER + (2 if is_broad_query else 0)
+        effective_min_candidates = VECTOR_MIN_CANDIDATES + (20 if is_broad_query else 0)
+
+        candidate_count = max(effective_top_k * effective_multiplier, effective_min_candidates)
+        candidate_count = min(candidate_count, VECTOR_MAX_CANDIDATES)
+
+        return {
+            'top_k': effective_top_k,
+            'candidate_count': candidate_count,
+            'broad_query': is_broad_query,
+        }
+
+    def vector_search(
+        self,
+        query_embedding: List[float],
+        top_k: Optional[int] = None,
+        user_query: str = '',
+    ) -> List[Dict[str, Any]]:
         """
         Search Supabase vector database for similar documents
         
@@ -1005,8 +1067,16 @@ class RAGPipeline:
         Returns:
             List of relevant document chunks with metadata
         """
-        candidate_count = max(TOP_K_RESULTS * VECTOR_CANDIDATE_MULTIPLIER, VECTOR_MIN_CANDIDATES)
-        print(f"🔎 Step 3: Searching vector database (top {candidate_count} candidates → rerank to {TOP_K_RESULTS})...")
+        retrieval_budget = self._compute_retrieval_budget(user_query, top_k)
+        candidate_count = retrieval_budget['candidate_count']
+        effective_top_k = retrieval_budget['top_k']
+        broad_query = retrieval_budget['broad_query']
+
+        print(
+            "🔎 Step 3: Searching vector database "
+            f"(top {candidate_count} candidates → rerank to {effective_top_k}"
+            f"; broad_query={broad_query})..."
+        )
         
         try:
             # ================================================================
@@ -1049,10 +1119,25 @@ class RAGPipeline:
             if len(token) > 2
         }
 
-    def _rerank_and_filter_chunks(self, user_query: str, retrieved_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _extract_used_citation_counts(self, answer_text: str) -> Dict[str, int]:
+        """Extract [S#] citation tags from answer text and count their usage."""
+        citation_counts: Dict[str, int] = {}
+        for match in re.findall(r"\[\s*S(\d+)\s*\]", answer_text or '', flags=re.IGNORECASE):
+            tag = f"S{int(match)}"
+            citation_counts[tag] = citation_counts.get(tag, 0) + 1
+        return citation_counts
+
+    def _rerank_and_filter_chunks(
+        self,
+        user_query: str,
+        retrieved_chunks: List[Dict[str, Any]],
+        top_k: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         """Filter low-information chunks and rerank candidates before top-k selection."""
         if not retrieved_chunks:
             return []
+
+        effective_top_k = max(3, min(top_k or TOP_K_RESULTS, 12))
 
         query_terms = self._tokenize_terms(user_query)
         scored_chunks = []
@@ -1087,7 +1172,7 @@ class RAGPipeline:
 
         if not scored_chunks:
             # Fail-safe: if filters were too strict, use original results.
-            return retrieved_chunks[:TOP_K_RESULTS]
+            return retrieved_chunks[:effective_top_k]
 
         scored_chunks.sort(
             key=lambda item: (
@@ -1103,7 +1188,7 @@ class RAGPipeline:
             f"dropped {dropped_for_quality} low-information chunks, kept {len(scored_chunks)}"
         )
 
-        return scored_chunks[:TOP_K_RESULTS]
+        return scored_chunks[:effective_top_k]
     
     # ========================================================================
     # STEP 4: LLM PROMPT PREPARATION
@@ -1119,6 +1204,154 @@ class RAGPipeline:
         }
         lowered_query = (user_query or '').lower()
         return any(keyword in lowered_query for keyword in process_keywords)
+
+    def _is_affirmative_confirmation(self, user_query: str) -> bool:
+        """Return True when user sends a short affirmative reply (e.g., 'yes')."""
+        lowered = (user_query or '').strip().lower()
+        if not lowered:
+            return False
+
+        confirmation_patterns = [
+            r'^(yes|yeah|yep|ya|sure|ok|okay|please|go ahead|continue|proceed|tell me|show me)\b',
+            r'^(boleh|ya|ok|teruskan|sila|lanjut|iya|baik|boleh terus)\b',
+            r'^(oo|sige|pwede|tuloy|ige)\b',
+            r'^(c[oó]|v[aâ]ng|d[uư]ợc|ok)\b',
+        ]
+        return any(re.search(pattern, lowered) for pattern in confirmation_patterns)
+
+    def _detect_contextual_followup_confirmation(
+        self,
+        user_query: str,
+        conversation_history: Optional[List[Dict[str, str]]]
+    ) -> Optional[Dict[str, str]]:
+        """Rewrite bare confirmations into context-aware retrieval queries."""
+        if not conversation_history or not self._is_affirmative_confirmation(user_query):
+            return None
+
+        last_assistant_index = -1
+        for idx in range(len(conversation_history) - 1, -1, -1):
+            if (conversation_history[idx].get('role') or '').lower() == 'assistant':
+                last_assistant_index = idx
+                break
+
+        if last_assistant_index < 0:
+            return None
+
+        last_assistant_text = (conversation_history[last_assistant_index].get('text') or '').strip()
+        if not last_assistant_text or '?' not in last_assistant_text:
+            return None
+
+        previous_user_text = ''
+        for idx in range(last_assistant_index - 1, -1, -1):
+            if (conversation_history[idx].get('role') or '').lower() == 'user':
+                candidate = (conversation_history[idx].get('text') or '').strip()
+                if candidate:
+                    previous_user_text = candidate
+                    break
+
+        if not previous_user_text:
+            return None
+
+        assistant_lower = last_assistant_text.lower()
+        followup_type = 'fact_details'
+        if any(marker in assistant_lower for marker in ['next step', 'step-by-step', 'langkah seterusnya', 'walk you through']):
+            followup_type = 'process_steps'
+        elif any(marker in assistant_lower for marker in ['checklist', 'required document', 'requirements', 'dokumen', 'syarat']):
+            followup_type = 'eligibility_requirements'
+        elif any(marker in assistant_lower for marker in ['safe option', 'if this gets worse', 'retaliation', 'risk', 'amaran']):
+            followup_type = 'warning_or_risk'
+
+        if followup_type == 'process_steps':
+            contextual_query = f"{previous_user_text}. Please provide the detailed next steps in order."
+        elif followup_type == 'eligibility_requirements':
+            contextual_query = f"{previous_user_text}. Please provide full requirements and a document checklist."
+        elif followup_type == 'warning_or_risk':
+            contextual_query = f"{previous_user_text}. Please provide safer options, warnings, and what to do if the risk increases."
+        else:
+            contextual_query = f"{previous_user_text}. Please provide more details, related policy points, and practical examples."
+
+        return {
+            'followup_type': followup_type,
+            'contextual_query': contextual_query,
+        }
+
+    def _classify_followup_type(self, user_query: str, answer_text: str, allow_step_format: bool) -> str:
+        """Classify answer style to choose a tailored follow-up question."""
+        lowered_query = (user_query or '').lower()
+        lowered_answer = (answer_text or '').lower()
+
+        if allow_step_format or self._is_process_question(user_query):
+            return 'process_steps'
+
+        if any(token in lowered_query for token in ['eligible', 'eligibility', 'requirement', 'requirements', 'document', 'dokumen', 'syarat', 'layak']):
+            return 'eligibility_requirements'
+
+        if any(token in lowered_query for token in ['danger', 'threat', 'retaliation', 'risk', 'abuse', 'takut', 'bahaya']) or any(
+            token in lowered_answer for token in ['urgent', 'immediately', 'report', 'hotline', 'danger', 'risk']
+        ):
+            return 'warning_or_risk'
+
+        return 'fact_details'
+
+    def _get_followup_question(self, language_code: str, followup_type: str) -> str:
+        """Return language-aware follow-up question using adaptive or fixed style."""
+        fixed_templates = {
+            'en': 'Would you like help with the next step?',
+            'ms': 'Adakah anda memerlukan bantuan untuk langkah seterusnya?',
+            'id': 'Apakah anda memerlukan bantuan untuk langkah berikutnya?',
+            'tl': 'Kailangan mo ba ng tulong para sa susunod na hakbang?',
+            'jv': 'Apa kowe perlu bantuan kanggo langkah sabanjure?',
+            'th': 'คุณต้องการความช่วยเหลือสำหรับขั้นตอนถัดไปหรือไม่?',
+            'vi': 'Bạn có cần giúp đỡ cho bước tiếp theo không?',
+            'ilo': 'Kayat mo kadi ti tulong para iti sumaruno a langkah?',
+        }
+
+        adaptive_templates = {
+            'fact_details': {
+                'en': 'Would you like more details, related policy points, or practical examples for this?',
+                'ms': 'Adakah anda mahu butiran lanjut, poin dasar berkaitan, atau contoh praktikal untuk perkara ini?',
+                'id': 'Apakah Anda ingin detail tambahan, poin kebijakan terkait, atau contoh praktis untuk ini?',
+                'tl': 'Gusto mo ba ng mas detalyeng paliwanag, kaugnay na patakaran, o praktikal na halimbawa tungkol dito?',
+                'th': 'คุณต้องการรายละเอียดเพิ่มเติม ประเด็นนโยบายที่เกี่ยวข้อง หรือ ตัวอย่างที่ใช้ได้จริงไหม?',
+                'vi': 'Bạn có muốn thêm chi tiết, các điểm chính sách liên quan, hoặc ví dụ thực tế cho nội dung này không?',
+                'ilo': 'Kayat mo kadi ti ad-adu a detalye, mayannurot a patakaran, wenno praktikal a ehemplo maipapan iti daytoy?',
+            },
+            'process_steps': {
+                'en': 'Would you like me to walk you through the detailed next steps one by one?',
+                'ms': 'Adakah anda mahu saya bimbing langkah seterusnya satu demi satu dengan lebih terperinci?',
+                'id': 'Apakah Anda ingin saya pandu langkah berikutnya satu per satu secara lebih rinci?',
+                'tl': 'Gusto mo ba na gabayan kita sa susunod na mga hakbang nang paisa-isa?',
+                'th': 'ต้องการให้ฉันพาไล่ทีละขั้นตอนแบบละเอียดไหม?',
+                'vi': 'Bạn có muốn tôi hướng dẫn chi tiết từng bước tiếp theo không?',
+                'ilo': 'Kayat mo kadi nga iturong ka iti sumaruno a detalyado a langkah, maysa-maysa?',
+            },
+            'eligibility_requirements': {
+                'en': 'Would you like a full eligibility and document checklist tailored to your case?',
+                'ms': 'Adakah anda mahu senarai semak penuh kelayakan dan dokumen yang disesuaikan dengan kes anda?',
+                'id': 'Apakah Anda ingin daftar kelayakan dan checklist dokumen lengkap yang disesuaikan dengan kasus Anda?',
+                'tl': 'Gusto mo ba ng kumpletong checklist ng kwalipikasyon at dokumento na akma sa sitwasyon mo?',
+                'th': 'ต้องการเช็กลิสต์คุณสมบัติและเอกสารแบบครบถ้วนที่ตรงกับกรณีของคุณไหม?',
+                'vi': 'Bạn có muốn danh sách điều kiện và giấy tờ đầy đủ, phù hợp với trường hợp của bạn không?',
+                'ilo': 'Kayat mo kadi ti kumpleto a checklist ti kwalipikasion ken dokumento a maiyannatop iti kasasaad mo?',
+            },
+            'warning_or_risk': {
+                'en': 'Would you like safer options and what to do if this situation gets worse?',
+                'ms': 'Adakah anda mahu pilihan yang lebih selamat dan langkah jika keadaan ini menjadi lebih buruk?',
+                'id': 'Apakah Anda ingin opsi yang lebih aman dan langkah jika situasi ini memburuk?',
+                'tl': 'Gusto mo ba ng mas ligtas na mga opsyon at mga hakbang kung lumala pa ang sitwasyon?',
+                'th': 'ต้องการตัวเลือกที่ปลอดภัยกว่าและสิ่งที่ควรทำหากสถานการณ์แย่ลงไหม?',
+                'vi': 'Bạn có muốn các lựa chọn an toàn hơn và cần làm gì nếu tình huống xấu đi không?',
+                'ilo': 'Kayat mo kadi dagiti natalged nga opsion ken aramiden no lumala ti kasasaad?',
+            },
+        }
+
+        lang_code = language_code if language_code in fixed_templates else 'en'
+        if FOLLOW_UP_STYLE == 'fixed':
+            return fixed_templates.get(lang_code, fixed_templates['en'])
+        if FOLLOW_UP_STYLE == 'adaptive':
+            templates = adaptive_templates.get(followup_type, adaptive_templates['fact_details'])
+            return templates.get(lang_code, templates['en'])
+        return ''
 
     def _is_summary_request(self, user_query: str) -> bool:
         """Detect explicit user intent to receive a summary output."""
@@ -2473,7 +2706,7 @@ Always:
 
         # Language-specific follow-up questions (avoid asking if already a question at the end)
         self._should_add_followup = False
-        if FORCE_FOLLOW_UP_QUESTION and '[STEP_GATE]' not in answer_text:
+        if FORCE_FOLLOW_UP_QUESTION and FOLLOW_UP_STYLE != 'off' and '[STEP_GATE]' not in answer_text:
             # Check if response already ends with a question
             answer_stripped = answer_text.strip()
             already_has_question = re.search(r"[?]\s*$", answer_stripped)
@@ -2496,21 +2729,14 @@ Always:
                     is_user_confirming = any(user_query_lower.startswith(p) for p in confirmation_patterns)
             
             if not already_has_question and not is_user_confirming:
-                # Add language-specific follow-up question
-                followup_questions = {
-                    'en': 'Would you like help with the next step?',
-                    'ms': 'Adakah anda memerlukan bantuan untuk langkah seterusnya?',
-                    'id': 'Apakah anda memerlukan bantuan untuk langkah berikutnya?',
-                    'tl': 'Kailangan mo ba ng tulong para sa susunod na hakbang?',
-                    'jv': 'Apa kowe perlu bantuan kanggo langkah sabanjure?',
-                    'th': 'คุณต้องการความช่วยเหลือสำหรับขั้นตอนถัดไปหรือไม่?',
-                    'vi': 'Bạn có cần giúp đỡ cho bước tiếp theo không?',
-                    'ilo': 'Kayat mo kadi ti tulong para iti sumaruno a langkah?',
-                }
-                lang_code = resolved_language if resolved_language in followup_questions else 'en'
-                followup_text = followup_questions[lang_code]
-                answer_text = f"{answer_text.rstrip()}\n\n{followup_text}"
-                self._should_add_followup = True
+                followup_type = self._classify_followup_type(user_query, answer_text, allow_step_format)
+                followup_text = self._get_followup_question(resolved_language, followup_type)
+                if followup_text:
+                    answer_text = f"{answer_text.rstrip()}\n\n{followup_text}"
+                    self._should_add_followup = True
+                    self._log_debug(
+                        f"[Step 6] ❓ Added follow-up (style={FOLLOW_UP_STYLE}, type={followup_type}, lang={resolved_language})"
+                    )
 
         if effective_answer_style != 'bullet':
             answer_items = [answer_text]
@@ -2670,6 +2896,104 @@ Simplified text:
         simplified_text = self.call_llm(prompt)
         self._log_debug(f"[Simplify] ✅ Text simplified.")
         return simplified_text
+
+    def _normalize_phrase_for_match(self, text: str) -> str:
+        normalized = (text or '').lower().strip()
+        normalized = re.sub(r'[^\w\s]', ' ', normalized)
+        normalized = re.sub(r'\s+', ' ', normalized)
+        return normalized
+
+    def _get_approved_slang_terms(self) -> List[Dict[str, Any]]:
+        if not ENABLE_SLANG_QUERY_EXPANSION:
+            return []
+
+        now = time.time()
+        cache_age = now - self.slang_terms_cache_loaded_at
+        if self.slang_terms_cache and cache_age < SLANG_TERMS_CACHE_TTL_SECONDS:
+            return self.slang_terms_cache
+
+        try:
+            response = (
+                self.supabase_client
+                .table(SLANG_DICTIONARY_TABLE_NAME)
+                .select('phrase,normalized_form,meaning,dialect,language_code,is_active,status')
+                .eq('status', 'approved')
+                .eq('is_active', True)
+                .limit(1000)
+                .execute()
+            )
+            rows = response.data or []
+            self.slang_terms_cache = rows
+            self.slang_terms_cache_loaded_at = now
+            return rows
+        except Exception as exc:
+            self._log_debug(
+                f"[Step 1.6] ⚠️ Slang lookup unavailable ({SLANG_DICTIONARY_TABLE_NAME}): {exc}"
+            )
+            self.slang_terms_cache = []
+            self.slang_terms_cache_loaded_at = now
+            return []
+
+    def _expand_query_with_slang(self, query: str) -> Tuple[str, List[Dict[str, str]]]:
+        if not ENABLE_SLANG_QUERY_EXPANSION:
+            return query, []
+
+        normalized_query = self._normalize_phrase_for_match(query)
+        if not normalized_query:
+            return query, []
+
+        approved_terms = self._get_approved_slang_terms()
+        if not approved_terms:
+            return query, []
+
+        expansions: List[Dict[str, str]] = []
+        expansion_terms: List[str] = []
+
+        for row in approved_terms:
+            phrase = str(row.get('phrase') or '').strip()
+            if not phrase:
+                continue
+
+            normalized_phrase = self._normalize_phrase_for_match(phrase)
+            if not normalized_phrase:
+                continue
+
+            # Match complete phrase first to reduce accidental partial hits.
+            phrase_pattern = rf'(^|\s){re.escape(normalized_phrase)}(\s|$)'
+            if not re.search(phrase_pattern, normalized_query):
+                continue
+
+            normalized_form = str(row.get('normalized_form') or '').strip()
+            meaning = str(row.get('meaning') or '').strip()
+            expansion = normalized_form or meaning
+            if not expansion:
+                continue
+
+            expansions.append({
+                'phrase': phrase,
+                'expansion': expansion,
+                'dialect': str(row.get('dialect') or ''),
+                'language_code': str(row.get('language_code') or ''),
+            })
+            expansion_terms.append(expansion)
+
+            if len(expansions) >= SLANG_MAX_TERMS_PER_QUERY:
+                break
+
+        deduped_terms: List[str] = []
+        seen = set()
+        for term in expansion_terms:
+            key = term.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped_terms.append(term)
+
+        if not deduped_terms:
+            return query, []
+
+        expanded_query = f"{query.strip()} {' '.join(deduped_terms)}".strip()
+        return expanded_query, expansions
     
     # ========================================================================
     # STEP 7: MAIN PIPELINE EXECUTION
@@ -2684,6 +3008,8 @@ Simplified text:
         self,
         user_query: str,
         user_language_hint: Optional[str] = None,
+        top_k: Optional[int] = None,
+        summary_mode_enabled: Optional[bool] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
         conversation_summary: str = "",
     ) -> Dict[str, Any]:
@@ -2702,6 +3028,11 @@ Simplified text:
         Args:
             user_query: User's input query in any ASEAN dialect
             user_language_hint: Optional language code from frontend (e.g., 'ms', 'en', 'zh')
+            top_k: Optional retrieval width override from frontend
+            summary_mode_enabled: Optional hard toggle from UI.
+                True = force summary mode.
+                False = force normal mode.
+                None = infer from user query intent.
             conversation_history: Recent conversation turns for short-term memory
             conversation_summary: Rolling summary of earlier turns
             
@@ -2710,6 +3041,7 @@ Simplified text:
         """
         # Clear debug logs for this query
         self.debug_logs = []
+        self.last_query_expansions = []
         
         self._log_debug("\n" + "="*70)
         self._log_debug(f"🎯 Processing Query: '{user_query}'")
@@ -2722,6 +3054,7 @@ Simplified text:
             self._log_debug("[Step 0] 🧭 Classifying query intent...")
             intent = self.classify_query_intent(user_query)
             self._log_debug(f"[Step 0] ✓ Intent: {intent}")
+            retrieval_query_override = None
 
             # Override: a step-gate confirmation must always run full RAG
             if intent == 'general' and self._detect_step_confirmation(user_query, conversation_history):
@@ -2733,6 +3066,15 @@ Simplified text:
             if intent == 'general' and self._detect_labour_office_followup_confirmation(user_query, conversation_history):
                 intent = 'task_or_policy'
                 self._log_debug("[Step 0] 🔄 Labour-office follow-up confirmation detected — overriding intent to task_or_policy")
+
+            contextual_followup = self._detect_contextual_followup_confirmation(user_query, conversation_history)
+            if intent == 'general' and contextual_followup:
+                intent = 'task_or_policy'
+                retrieval_query_override = contextual_followup.get('contextual_query')
+                self._log_debug(
+                    "[Step 0] 🔄 Contextual follow-up confirmation detected "
+                    f"(type={contextual_followup.get('followup_type')}) — overriding intent to task_or_policy"
+                )
 
             # Step 1: Detect language/dialect
             self._log_debug("[Step 1] 🔍 Detecting language...")
@@ -2810,6 +3152,7 @@ Simplified text:
                 final_response['intent'] = 'general'
                 final_response['rag_used'] = False
                 final_response['evidence'] = []
+                final_response['query_expansions'] = self.last_query_expansions
                 final_response['detected_language'] = (
                     final_response.get('language', detected_language)
                     if ENABLE_LANGUAGE_AUTO_DETECTION
@@ -2843,6 +3186,7 @@ Simplified text:
                     'user_language_code': user_nllb_code,
                     'timestamp': datetime.now().isoformat(),
                     'status': 'low_resource_dialect',
+                    'query_expansions': self.last_query_expansions,
                     'debug_logs': self.debug_logs,
                     'translation_note': (
                         "Low-resource dialect: neither embedding model nor NLLB-200 "
@@ -2851,7 +3195,7 @@ Simplified text:
                 }
             
             # Step 1.5: Choose retrieval language (direct vs pivot translation)
-            query_for_retrieval = user_query
+            query_for_retrieval = retrieval_query_override or user_query
             translation_note = None
             should_translate_query = False
 
@@ -2893,6 +3237,18 @@ Simplified text:
                     # Add disclaimer if translation is needed but disabled
                     if user_nllb_code not in PIVOT_LANGUAGES:
                         translation_note = f"⚠️ Note: Translation unavailable. Showing results in Malay/English."
+
+            # Step 1.6: Expand slang/local phrases using approved community dictionary.
+            expanded_query_for_retrieval, matched_expansions = self._expand_query_with_slang(query_for_retrieval)
+            if matched_expansions:
+                self.last_query_expansions = matched_expansions
+                query_for_retrieval = expanded_query_for_retrieval
+                self._log_debug(
+                    "[Step 1.6] 🧩 Query expanded using community dictionary: "
+                    + ", ".join(f"{item['phrase']}→{item['expansion']}" for item in matched_expansions)
+                )
+            else:
+                self._log_debug("[Step 1.6] ℹ️ No community slang expansions matched")
             
             # Step 2: Create query embedding (from translated query)
             self._log_debug("[Step 2] 📊 Creating query embedding...")
@@ -2901,8 +3257,16 @@ Simplified text:
             
             # Step 3: Vector search
             self._log_debug("[Step 3] 🔎 Searching vector database...")
-            retrieved_chunks = self.vector_search(query_embedding)
-            retrieved_chunks = self._rerank_and_filter_chunks(query_for_retrieval, retrieved_chunks)
+            retrieved_chunks = self.vector_search(
+                query_embedding,
+                top_k=top_k,
+                user_query=query_for_retrieval,
+            )
+            retrieved_chunks = self._rerank_and_filter_chunks(
+                query_for_retrieval,
+                retrieved_chunks,
+                top_k=top_k,
+            )
 
             # Optional augmentation: if user asks to find nearest labour office (or confirms "yes"
             # to that question), fetch directory contacts from Supabase and prepend them.
@@ -2947,31 +3311,55 @@ Simplified text:
                     'user_language_code': user_nllb_code,
                     'timestamp': datetime.now().isoformat(),
                     'status': 'no_results',
+                    'query_expansions': self.last_query_expansions,
                     'debug_logs': self.debug_logs,
                     'translation_note': translation_note
                 }
             
             self._log_debug(f"[Step 3] ✓ Found {len(retrieved_chunks)} relevant chunks")
 
+            prompt_chunks = retrieved_chunks
             compressed_chunks = self._compress_retrieved_chunks(query_for_retrieval, retrieved_chunks)
             effective_answer_style = ANSWER_STYLE
-            summary_requested = self._is_summary_request(user_query)
+            inferred_summary_requested = self._is_summary_request(user_query)
+            summary_requested = inferred_summary_requested
             auto_summary_triggered = False
+
+            if summary_mode_enabled is True:
+                summary_requested = True
+                self._log_debug("[Step 4] 🧭 Summary mode forced ON by user toggle")
+            elif summary_mode_enabled is False:
+                summary_requested = False
+                self._log_debug("[Step 4] 🧭 Summary mode forced OFF by user toggle")
+
             if summary_requested:
                 effective_answer_style = 'bullet'
-                self._log_debug("[Step 4] 🧭 User requested summary; forcing bullet summary mode")
-            elif self._should_auto_action_bullet_summary(user_query, retrieved_chunks, compressed_chunks):
+                if summary_mode_enabled is True:
+                    self._log_debug("[Step 4] 🧭 User toggle enabled summary; forcing bullet summary mode")
+                elif inferred_summary_requested:
+                    self._log_debug("[Step 4] 🧭 User requested summary; forcing bullet summary mode")
+            elif summary_mode_enabled is None and self._should_auto_action_bullet_summary(user_query, retrieved_chunks, compressed_chunks):
                 effective_answer_style = 'bullet'
                 auto_summary_triggered = True
             self._log_debug(f"[Step 4] ✍️ Effective response style: {effective_answer_style}")
 
             summary_mode_active = summary_requested or auto_summary_triggered
-            summary_mode_reason = 'user_requested' if summary_requested else ('auto_long_context' if auto_summary_triggered else None)
+            summary_mode_reason = None
+            if summary_mode_enabled is True and summary_mode_active:
+                summary_mode_reason = 'user_toggle_on'
+            elif summary_mode_enabled is False:
+                summary_mode_reason = 'user_toggle_off'
+            elif summary_requested:
+                summary_mode_reason = 'user_requested'
+            elif auto_summary_triggered:
+                summary_mode_reason = 'auto_long_context'
 
             recursive_context_summary = ""
             summary_context_chunks = retrieved_chunks
             if summary_requested:
                 summary_context_chunks = self._expand_chunks_by_source_url(retrieved_chunks)
+                prompt_chunks = summary_context_chunks
+                compressed_chunks = self._compress_retrieved_chunks(query_for_retrieval, summary_context_chunks)
                 recursive_source_blocks = []
                 for idx, chunk in enumerate(summary_context_chunks, 1):
                     # Use richer chunk text here so recursive summarization has enough depth.
@@ -2983,10 +3371,21 @@ Simplified text:
                 if len(recursive_input_text) > RECURSIVE_SUMMARY_INPUT_MAX_CHARS:
                     recursive_input_text = recursive_input_text[:RECURSIVE_SUMMARY_INPUT_MAX_CHARS]
 
+                # Fallback: if expanded chunks exist but recursive text is empty, use compressed summaries.
+                if not recursive_input_text:
+                    recursive_input_text = "\n\n".join(
+                        (chunk.get('summary') or chunk.get('content') or chunk.get('text') or '').strip()
+                        for chunk in compressed_chunks
+                        if (chunk.get('summary') or chunk.get('content') or chunk.get('text') or '').strip()
+                    )
+                    if len(recursive_input_text) > RECURSIVE_SUMMARY_INPUT_MAX_CHARS:
+                        recursive_input_text = recursive_input_text[:RECURSIVE_SUMMARY_INPUT_MAX_CHARS]
+
                 if recursive_input_text:
                     self._log_debug(
                         "[Step 4] 🔁 Running recursive summarization for summary-mode response "
-                        f"(chars={len(recursive_input_text)}, chunk_size={RECURSIVE_SUMMARY_CHUNK_SIZE})"
+                        f"(chars={len(recursive_input_text)}, chunk_size={RECURSIVE_SUMMARY_CHUNK_SIZE}, "
+                        f"expanded_chunks={len(summary_context_chunks)})"
                     )
                     recursive_context_summary = self.summarize_document(
                         recursive_input_text,
@@ -3014,7 +3413,7 @@ Simplified text:
 
             # Step 4: Prepare prompt (use pivot language for LLM)
             self._log_debug("[Step 4] 📝 Preparing LLM prompt...")
-            is_process_question = self._is_process_question(user_query)
+            is_process_question = self._is_process_question(retrieval_query_override or user_query)
 
             # Step-gating is optional; default is direct step-by-step response.
             step_confirmed = self._detect_step_confirmation(user_query, conversation_history)
@@ -3022,7 +3421,7 @@ Simplified text:
 
             prompt = self.prepare_llm_prompt(
                 query_for_retrieval,  # Use translated query
-                retrieved_chunks,
+                prompt_chunks,
                 detected_language if ENABLE_LANGUAGE_AUTO_DETECTION
                 else ('zsm_Latn' if user_nllb_code != 'eng_Latn' else 'eng_Latn'),
                 conversation_history=conversation_history,
@@ -3114,6 +3513,40 @@ Simplified text:
             final_response['evidence'] = evidence
             final_response['summary_mode'] = summary_mode_active
             final_response['summary_mode_reason'] = summary_mode_reason
+            final_response['query_expansions'] = self.last_query_expansions
+
+            citation_source_text = final_response.get('raw_response') or final_response.get('answer_text', '')
+            citation_counts = self._extract_used_citation_counts(citation_source_text)
+            used_tags = {
+                item['citation_tag']
+                for item in evidence
+                if citation_counts.get(item['citation_tag'], 0) > 0
+            }
+
+            for item in evidence:
+                usage_count = citation_counts.get(item['citation_tag'], 0)
+                item['cited_in_answer'] = usage_count > 0
+                item['citation_usage_count'] = usage_count
+
+            ordered_tags = [item['citation_tag'] for item in evidence]
+            used_ordered = [tag for tag in ordered_tags if tag in used_tags]
+            unused_ordered = [tag for tag in ordered_tags if tag not in used_tags]
+            coverage = (len(used_ordered) / len(ordered_tags)) if ordered_tags else 0.0
+
+            final_response['used_citation_tags'] = used_ordered
+            final_response['unused_citation_tags'] = unused_ordered
+            final_response['citation_stats'] = {
+                'used_count': len(used_ordered),
+                'unused_count': len(unused_ordered),
+                'retrieved_count': len(ordered_tags),
+                'coverage': round(coverage, 3),
+                'tracking_source': 'raw_response' if final_response.get('raw_response') else 'answer_text',
+            }
+
+            self._log_debug(
+                "[Step 6] 🔗 Citation usage: "
+                f"used={len(used_ordered)}, unused={len(unused_ordered)}, retrieved={len(ordered_tags)}"
+            )
 
             # Add sources for frontend display with all required fields
             formatted_sources = []
@@ -3167,6 +3600,7 @@ Simplified text:
                 'language': 'en',
                 'timestamp': datetime.now().isoformat(),
                 'status': 'error',
+                'query_expansions': self.last_query_expansions,
                 'debug_logs': self.debug_logs
             }
 
