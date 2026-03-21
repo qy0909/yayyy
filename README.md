@@ -35,10 +35,20 @@
 ### Prerequisites
 - Node.js (v18+)
 - Python (v3.10+)
+- FFmpeg (Required for Whisper Voice-to-Text processing)
 - A Supabase account and database
 - Free API Keys: Groq and Hugging Face
 
-### 1. Setup the Backend (FastAPI)
+### 1. Install System Dependencies (FFmpeg)
+FFmpeg is required for the voice-to-text functionality. Choose the command for your OS:
+
+- **macOS:** brew install ffmpeg
+
+- **Linux:** sudo apt update && sudo apt install ffmpeg
+
+- **Windows:** choco install ffmpeg (or download from ffmpeg.org)
+
+### 2. Setup the Backend (FastAPI)
 
 Navigate to the backend directory, set up your virtual environment, and install dependencies:
 
@@ -71,7 +81,7 @@ python main.py
 # Server runs on http://127.0.0.1:8000
 ```
 
-### 2. Setup the Frontend (Next.js)
+### 3. Setup the Frontend (Next.js)
 
 Open a new terminal and navigate to the root directory:
 
@@ -90,3 +100,7 @@ Start the development server:
 npm run dev
 # App runs on http://localhost:3000
 ```
+
+
+
+
