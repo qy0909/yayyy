@@ -37,3 +37,7 @@ beautifulsoup4==4.12.3
 
 # Utilities
 numpy==2.0.2
+
+# Audio & Text
+openai-whisper==20250625
+edge-tts==7.2.7
